@@ -87,6 +87,8 @@
   .tk-typ { color:#ffa657; }                       /* Type / class names */
   .tk-con { color:#79c0ff; }                       /* CONSTANTS */
   .tk-ann { color:#d2a8ff; }                       /* @Annotations */
+  .tk-fun { color:#e3b341; }                       /* method names */
+  .tk-lit { color:#79c0ff; font-style:italic; }    /* true / false / null */
 
   /* ---- mobile / narrow screens ---- */
   @media (max-width:720px) {
@@ -290,11 +292,12 @@ $("#search").addEventListener("input", e => {
 });
 
 // ---- lightweight Java syntax highlighter (dependency-free) ----
-const JAVA_KW = new Set(("abstract assert boolean break byte case catch char class const " +
-  "continue default do double else enum extends final finally float for goto if implements " +
-  "import instanceof int interface long native new package private protected public return " +
-  "short static strictfp super switch synchronized this throw throws transient try void " +
-  "volatile while var true false null").split(" "));
+const KW_PRIM = new Set("boolean byte char double float int long short void var".split(" "));
+const KW_LIT  = new Set(["true", "false", "null"]);
+const JAVA_KW = new Set(("abstract assert break case catch class const continue default do " +
+  "else enum extends final finally for goto if implements import instanceof interface native " +
+  "new package private protected public return static strictfp super switch synchronized this " +
+  "throw throws transient try volatile while").split(" "));
 function escHtml(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
@@ -318,9 +321,12 @@ function highlight(code) {
     else if (m[3]) cls = "tk-ann";
     else if (m[4]) cls = "tk-num";
     else {                                       // identifier
-      if (JAVA_KW.has(t)) cls = "tk-key";
+      if (KW_PRIM.has(t)) cls = "tk-typ";        // primitives group with class types
+      else if (KW_LIT.has(t)) cls = "tk-lit";    // true / false / null
+      else if (JAVA_KW.has(t)) cls = "tk-key";
       else if (t.length > 1 && /^[A-Z][A-Z0-9_]*$/.test(t)) cls = "tk-con";
-      else if (/^[A-Z]/.test(t)) cls = "tk-typ";
+      else if (/^[A-Z]/.test(t)) cls = "tk-typ"; // Type / constructor (even if a call)
+      else if (/^\s*\(/.test(code.slice(last))) cls = "tk-fun";  // lowercase + '(' = method
     }
     out += cls ? `<span class="${cls}">${escHtml(t)}</span>` : escHtml(t);
   }
