@@ -87,6 +87,7 @@
   .tk-con { color:#56d4dd; }                       /* CONSTANTS    — cyan   */
   .tk-num { color:#79c0ff; }                       /* numbers      — blue   */
   .tk-fun { color:#d2a8ff; }                       /* methods      — purple */
+  .tk-var { color:#9cdcfe; }                       /* variables/fields — light blue */
   .tk-lit { color:#f778ba; font-style:italic; }    /* true/false/null — magenta */
   .tk-com { color:#8b949e; font-style:italic; }    /* comments     — gray   */
 
@@ -326,7 +327,8 @@ function highlight(code) {
       else if (JAVA_KW.has(t)) cls = "tk-key";
       else if (t.length > 1 && /^[A-Z][A-Z0-9_]*$/.test(t)) cls = "tk-con";
       else if (/^[A-Z]/.test(t)) cls = "tk-typ"; // Type / constructor (even if a call)
-      else if (/^\s*\(/.test(code.slice(last))) cls = "tk-fun";  // lowercase + '(' = method
+      else if (/^([vp]\d|[ms][A-Z])/.test(t)) cls = "tk-var";   // v1/p5 locals+params, mX/sX fields
+      else if (/^\s*\(/.test(code.slice(last))) cls = "tk-fun"; // lowercase + '(' = method
     }
     out += cls ? `<span class="${cls}">${escHtml(t)}</span>` : escHtml(t);
   }
