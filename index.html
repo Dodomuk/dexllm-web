@@ -79,16 +79,16 @@
   .placeholder { color:var(--muted); padding:24px; }
   a { color:var(--accent); }
 
-  /* ---- Java syntax highlight tokens ---- */
-  .tk-com { color:#8b949e; font-style:italic; }   /* comments */
-  .tk-str { color:#a5d6ff; }                       /* "strings" / 'chars' */
-  .tk-num { color:#79c0ff; }                       /* numbers */
-  .tk-key { color:#ff7b72; }                       /* keywords */
-  .tk-typ { color:#ffa657; }                       /* Type / class names */
-  .tk-con { color:#79c0ff; }                       /* CONSTANTS */
-  .tk-ann { color:#d2a8ff; }                       /* @Annotations */
-  .tk-fun { color:#e3b341; }                       /* method names */
-  .tk-lit { color:#79c0ff; font-style:italic; }    /* true / false / null */
+  /* ---- Java syntax highlight tokens (hues spread across the wheel) ---- */
+  .tk-key { color:#ff7b72; }                       /* keywords     — red    */
+  .tk-typ { color:#ffa657; }                       /* type/class   — orange */
+  .tk-ann { color:#e3b341; }                       /* @annotation  — gold   */
+  .tk-str { color:#7ee787; }                       /* strings      — green  */
+  .tk-con { color:#56d4dd; }                       /* CONSTANTS    — cyan   */
+  .tk-num { color:#79c0ff; }                       /* numbers      — blue   */
+  .tk-fun { color:#d2a8ff; }                       /* methods      — purple */
+  .tk-lit { color:#f778ba; font-style:italic; }    /* true/false/null — magenta */
+  .tk-com { color:#8b949e; font-style:italic; }    /* comments     — gray   */
 
   /* ---- mobile / narrow screens ---- */
   @media (max-width:720px) {
