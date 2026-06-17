@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dexllm — in-browser DEX/APK decompiler</title>
+<style>
+  :root {
+    --bg:#0d1117; --panel:#161b22; --border:#30363d; --fg:#c9d1d9;
+    --muted:#8b949e; --accent:#58a6ff; --ok:#3fb950; --bad:#f85149;
+    --hl:#1f6feb33;
+  }
+  * { box-sizing:border-box; }
+  html,body { height:100%; margin:0; }
+  body {
+    background:var(--bg); color:var(--fg); font:13px/1.5 "SF Mono",
+    ui-monospace,"Cascadia Code",Menlo,Consolas,monospace;
+    display:flex; flex-direction:column;
+  }
+  header {
+    padding:10px 16px; border-bottom:1px solid var(--border);
+    background:var(--panel); display:flex; align-items:center; gap:14px;
+    flex-wrap:wrap;
+  }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  header h1 span { color:var(--accent); }
+  .sub { color:var(--muted); font-size:11px; }
+  #status { margin-left:auto; font-size:12px; color:var(--muted); }
+  #status b { color:var(--fg); }
+  .pill { padding:1px 7px; border-radius:10px; font-size:11px; }
+  .pill.ok { background:#23863633; color:var(--ok); }
+  .pill.bad { background:#da363333; color:var(--bad); }
+
+  #drop {
+    flex:1; display:flex; align-items:center; justify-content:center;
+    flex-direction:column; gap:10px; margin:24px; border:2px dashed var(--border);
+    border-radius:12px; color:var(--muted); cursor:pointer; text-align:center;
+  }
+  #drop.drag { border-color:var(--accent); background:var(--hl); color:var(--fg); }
+  #drop .big { font-size:20px; color:var(--fg); }
+  #drop input { display:none; }
+
+  main { flex:1; display:none; min-height:0; }
+  main.show { display:flex; }
+  #sidebar {
+    width:380px; min-width:240px; border-right:1px solid var(--border);
+    display:flex; flex-direction:column; background:var(--panel);
+  }
+  #search {
+    margin:8px; padding:7px 9px; background:var(--bg); border:1px solid var(--border);
+    color:var(--fg); border-radius:6px; font:inherit;
+  }
+  #search:focus { outline:none; border-color:var(--accent); }
+  #count { padding:0 12px 6px; color:var(--muted); font-size:11px; }
+  #classlist { overflow:auto; flex:1; }
+  .cls {
+    padding:4px 12px; cursor:pointer; white-space:nowrap; overflow:hidden;
+    text-overflow:ellipsis; border-left:2px solid transparent;
+  }
+  .cls:hover { background:#ffffff0a; }
+  .cls.sel { background:var(--hl); border-left-color:var(--accent); color:#fff; }
+
+  #viewer { flex:1; display:flex; flex-direction:column; min-width:0; }
+  #vhead {
+    padding:8px 14px; border-bottom:1px solid var(--border); color:var(--muted);
+    font-size:12px; display:flex; gap:10px; align-items:center;
+  }
+  #vhead .name { color:var(--fg); }
+  #code { flex:1; overflow:auto; margin:0; padding:14px 18px; white-space:pre;
+    tab-size:4; }
+  .placeholder { color:var(--muted); padding:24px; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>dex<span>llm</span></h1>
+  <span class="sub">in-browser DEX / APK decompiler · runs entirely on your device (WASM)</span>
+  <div id="status">loading engine…</div>
+</header>
+
+<label id="drop" for="file">
+  <div class="big">⬇ Drop a <b>.apk</b> / <b>.dex</b> / <b>.jar</b> here</div>
+  <div>or click to choose a file — nothing is uploaded, decompilation runs locally</div>
+  <input id="file" type="file" accept=".apk,.dex,.jar,.zip,application/octet-stream">
+</label>
+
+<main id="main">
+  <div id="sidebar">
+    <input id="search" placeholder="filter classes…" autocomplete="off">
+    <div id="count"></div>
+    <div id="classlist"></div>
+  </div>
+  <div id="viewer">
+    <div id="vhead"><span class="name" id="vname">— select a class —</span>
+      <span id="vmeta"></span></div>
+    <pre id="code"><div class="placeholder">Pick a class on the left to decompile it.</div></pre>
+  </div>
+</main>
+
+<script src="dexllm.js"></script>
+<script>
+let Module = null, dk = null, allClasses = [], selectedEl = null;
+const $ = s => document.querySelector(s);
+const statusEl = $("#status");
+
+createDexllm().then(m => {
+  Module = m;
+  statusEl.innerHTML = "engine ready · <b>drop a file</b>";
+}).catch(e => { statusEl.innerHTML = '<span class="pill bad">engine load failed</span>'; console.error(e); });
+
+// ---- file intake ----
+const drop = $("#drop");
+$("#file").addEventListener("change", e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+["dragenter","dragover"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("drag"); }));
+["dragleave","drop"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("drag"); }));
+drop.addEventListener("drop", e => { const f = e.dataTransfer.files[0]; if (f) loadFile(f); });
+
+async function loadFile(file) {
+  if (!Module) { alert("engine still loading…"); return; }
+  statusEl.innerHTML = `parsing <b>${file.name}</b>…`;
+  const buf = new Uint8Array(await file.arrayBuffer());
+  try { Module.FS.writeFile("/input.bin", buf); } catch (_) {
+    try { Module.FS.unlink("/input.bin"); } catch (_) {} Module.FS.writeFile("/input.bin", buf);
+  }
+  if (dk) { try { dk.delete(); } catch (_) {} dk = null; }
+
+  let t0 = performance.now();
+  try {
+    dk = new Module.DexKit("/input.bin");
+  } catch (err) {
+    const msg = (Module.getExceptionMessage && err && err.excPtr != null)
+      ? Module.getExceptionMessage(err.excPtr) : err;
+    statusEl.innerHTML = `<span class="pill bad">load failed</span> ${msg}`;
+    return;
+  }
+  const loadMs = (performance.now() - t0).toFixed(0);
+
+  // verifier verdict
+  const rep = dk.verifyReport();
+  let nbad = 0; const n = rep.length;
+  for (let i = 0; i < n; i++) if (!rep[i].valid) nbad++;
+  const vpill = nbad === 0
+    ? `<span class="pill ok">verified ✓</span>`
+    : `<span class="pill bad">${nbad}/${n} dex rejected</span>`;
+
+  // class list
+  const vec = dk.listClasses();
+  allClasses = [];
+  for (let i = 0; i < vec.size(); i++) allClasses.push(vec.get(i));
+  vec.delete();
+  allClasses.sort();
+
+  statusEl.innerHTML = `<b>${file.name}</b> · ${dk.dexCount()} dex · ${allClasses.length} classes · ${loadMs}ms ${vpill}`;
+  $("#main").classList.add("show");
+  drop.style.display = "none";
+  renderList("");
+  $("#search").value = ""; $("#search").focus();
+}
+
+// ---- class list + filter ----
+const listEl = $("#classlist"), countEl = $("#count");
+function renderList(filter) {
+  const f = filter.toLowerCase();
+  const items = f ? allClasses.filter(c => c.toLowerCase().includes(f)) : allClasses;
+  countEl.textContent = `${items.length} / ${allClasses.length} classes`;
+  const frag = document.createDocumentFragment();
+  const MAX = 4000;
+  items.slice(0, MAX).forEach(c => {
+    const div = document.createElement("div");
+    div.className = "cls"; div.textContent = c; div.title = c;
+    div.onclick = () => selectClass(c, div);
+    frag.appendChild(div);
+  });
+  listEl.innerHTML = "";
+  listEl.appendChild(frag);
+  if (items.length > MAX) {
+    const more = document.createElement("div");
+    more.className = "placeholder";
+    more.textContent = `… ${items.length - MAX} more — refine the filter`;
+    listEl.appendChild(more);
+  }
+}
+let searchTimer = null;
+$("#search").addEventListener("input", e => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => renderList(e.target.value), 120);
+});
+
+// ---- decompile ----
+function selectClass(cls, el) {
+  if (selectedEl) selectedEl.classList.remove("sel");
+  selectedEl = el; el.classList.add("sel");
+  $("#vname").textContent = cls;
+  $("#vmeta").textContent = "decompiling…";
+  $("#code").textContent = "";
+  // let the UI paint before the (synchronous) decompile
+  setTimeout(() => {
+    let t0 = performance.now();
+    let java;
+    try { java = dk.decompileClassJava(cls); }
+    catch (err) {
+      const msg = (Module.getExceptionMessage && err && err.excPtr != null)
+        ? Module.getExceptionMessage(err.excPtr) : err;
+      java = "// decompile failed: " + msg;
+    }
+    const ms = (performance.now() - t0).toFixed(0);
+    $("#vmeta").textContent = `${java.length} chars · ${ms}ms`;
+    $("#code").textContent = java || "// (empty — external/abstract class)";
+  }, 0);
+}
+</script>
+</body>
+</html>
