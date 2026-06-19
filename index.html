@@ -48,12 +48,12 @@
   #drop input { display:none; }
   /* looping clip parked in the bottom-right corner — non-interactive overlay */
   #loopvid {
-    position:fixed; right:14px; bottom:14px; z-index:50;
-    width:200px; max-width:38vw; aspect-ratio:16/9; border-radius:10px;
-    border:1px solid var(--border); box-shadow:0 4px 18px #000a;
-    object-fit:cover; background:#000; pointer-events:none; opacity:.92;
+    position:fixed; right:16px; bottom:16px; z-index:50;
+    width:380px; max-width:60vw; aspect-ratio:16/9; border-radius:12px;
+    border:1px solid var(--border); box-shadow:0 6px 26px #000c;
+    object-fit:cover; background:#000; pointer-events:none; opacity:1;
   }
-  @media (max-width:720px) { #loopvid { width:128px; right:8px; bottom:8px; } }
+  @media (max-width:720px) { #loopvid { width:240px; max-width:80vw; right:10px; bottom:10px; } }
 
   main { flex:1; display:none; min-height:0; }
   main.show { display:flex; }
