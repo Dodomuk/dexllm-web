@@ -159,9 +159,9 @@
 <body>
 <header>
   <h1>dex<span>llm</span></h1>
-  <a class="ver" href="https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/commit/5ef3870"
+  <a class="ver" href="https://github.com/mobile-threat-hunter/dex-analyzer-for-llm/commit/441a04b"
      target="_blank" rel="noopener" title="dexllm commit this WASM was built from">
-    v0.1.5 · <code>5ef3870</code>
+    v0.1.5 · <code>441a04b</code>
   </a>
   <span class="sub">in-browser DEX / APK decompiler · runs entirely on your device (WASM)</span>
   <div id="status">loading engine…</div>
@@ -213,7 +213,15 @@ const RE_HOST  = new RegExp("\\b(?:[a-z0-9](?:[a-z0-9\\-]{0,61}[a-z0-9])?\\.)+(?
 const RDN_ROOTS = new Set("com org net edu gov mil int".split(" "));
 const PLATFORM_ROOTS = new Set("android androidx java javax kotlin kotlinx dalvik sun junit".split(" "));
 const DROP_ROOTS = new Set([...RDN_ROOTS, ...PLATFORM_ROOTS]);
-const DROP_HOSTS = new Set(["schemas.android.com", "www.w3.org", "xmlpull.org"]);
+// XML-namespace / schema authority hosts. A URI like
+// `http://schemas.android.com/apk/res/android` is an XML namespace identifier
+// (xmlns:android=...), not a network endpoint — dropped from BOTH urls and
+// domains even though urls are otherwise never denoised. Curated, not pattern-based.
+const NAMESPACE_HOSTS = new Set([
+  "schemas.android.com", "schemas.xmlsoap.org", "schemas.microsoft.com",
+  "schemas.openxmlformats.org", "xmlpull.org", "www.xmlpull.org",
+  "www.w3.org", "w3.org", "java.sun.com", "ns.adobe.com", "purl.org",
+]);
 const PKG_LABEL = /^[a-z0-9_$]+$/;
 
 function dexPackagePrefixes(descriptors) {
@@ -229,7 +237,7 @@ function dexPackagePrefixes(descriptors) {
 }
 const isPackageLike = (host, pkgs) => {
   const low = host.toLowerCase();
-  return DROP_HOSTS.has(low) || pkgs.has(low) || DROP_ROOTS.has(low.split(".")[0]);
+  return NAMESPACE_HOSTS.has(low) || pkgs.has(low) || DROP_ROOTS.has(low.split(".")[0]);
 };
 const hostOf = url => ((url.split("://")[1] || "").split("/")[0].split("?")[0]);
 
@@ -237,7 +245,12 @@ function classifyStrings(strings, dexPkgs) {
   const b = { urls:new Set(), ips:new Set(), domains:new Set(), emails:new Set(), onion:new Set() };
   for (const s of strings) {
     let m;
-    RE_URL.lastIndex = 0;   while ((m = RE_URL.exec(s)))   b.urls.add(m[0].replace(/[.,);]+$/, ""));
+    RE_URL.lastIndex = 0;   while ((m = RE_URL.exec(s))) {
+      const url = m[0].replace(/[.,);]+$/, "");
+      // XML namespace URIs (xmlns=...) are identifiers, not endpoints — drop.
+      if (NAMESPACE_HOSTS.has(hostOf(url).split(":")[0].toLowerCase())) continue;
+      b.urls.add(url);
+    }
     RE_ONION.lastIndex = 0; while ((m = RE_ONION.exec(s))) b.onion.add(m[0].toLowerCase());
     RE_IPV4.lastIndex = 0;  while ((m = RE_IPV4.exec(s)))  b.ips.add(m[0]);
     RE_EMAIL.lastIndex = 0; while ((m = RE_EMAIL.exec(s))) b.emails.add(m[0]);
