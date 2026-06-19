@@ -75,6 +75,43 @@
   .pkg .pl { color:#d2a8ff; }
   .pkg .cnt { color:var(--muted); font-size:11px; margin-left:7px; }
 
+  /* ---- IOC (static C2 / network-indicator) markers ---- */
+  .ioc-badge {
+    display:inline-block; margin-left:7px; padding:0 6px; border-radius:9px;
+    font-size:10px; font-weight:600; line-height:16px; vertical-align:middle;
+    background:#da363333; color:var(--bad); border:1px solid #f8514955;
+  }
+  .pkg .ioc-badge { font-weight:500; }
+  #iocbar {
+    border-bottom:1px solid var(--border); background:#161b22; padding:0;
+    max-height:30vh; overflow:auto;
+  }
+  #iocbar.empty { display:none; }
+  #iocbar .iochd {
+    padding:7px 14px; color:var(--muted); font-size:11px;
+    display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+  }
+  #iocbar .iochd b { color:var(--bad); }
+  .iocrow { padding:3px 14px 3px 14px; display:flex; gap:8px; align-items:baseline; }
+  .iocrow .cat {
+    flex:0 0 64px; text-align:right; font-size:10px; text-transform:uppercase;
+    letter-spacing:.04em; padding-top:1px;
+  }
+  .iocrow .vals { display:flex; flex-wrap:wrap; gap:5px; }
+  .iocpill {
+    font-size:11px; padding:1px 7px; border-radius:10px; word-break:break-all;
+    border:1px solid var(--border); background:#0d1117;
+  }
+  .iocpill.copied { outline:1px solid var(--accent); }
+  .cat-urls,   .iocpill.urls   { color:#f85149; }
+  .cat-ips,    .iocpill.ips    { color:#ffa657; }
+  .cat-domains,.iocpill.domains{ color:#e3b341; }
+  .cat-onion,  .iocpill.onion  { color:#d2a8ff; }
+  .cat-emails, .iocpill.emails { color:#56d4dd; }
+  .iocpill.urls{border-color:#f8514955;} .iocpill.ips{border-color:#ffa65755;}
+  .iocpill.domains{border-color:#e3b34155;} .iocpill.onion{border-color:#d2a8ff55;}
+  .iocpill.emails{border-color:#56d4dd55;}
+
   #viewer { flex:1; display:flex; flex-direction:column; min-width:0; }
   #vhead {
     padding:8px 14px; border-bottom:1px solid var(--border); color:var(--muted);
@@ -145,6 +182,7 @@
   <div id="viewer">
     <div id="vhead"><span class="name" id="vname">— select a class —</span>
       <span id="vmeta"></span></div>
+    <div id="iocbar" class="empty"></div>
     <pre id="code"><div class="placeholder">Pick a class on the left to decompile it.</div></pre>
   </div>
 </main>
@@ -152,8 +190,109 @@
 <script src="dexllm.js"></script>
 <script>
 let Module = null, dk = null, allClasses = [], selectedEl = null;
+// classDescriptor -> { urls:Set, ips:Set, domains:Set, emails:Set, onion:Set }
+let classIoc = new Map();
+let iocTotals = null;            // { urls, ips, domains, emails, onion, total }
 const $ = s => document.querySelector(s);
 const statusEl = $("#status");
+
+// ---- static network-IOC (C2) extraction ----------------------------------
+// Port of dexllm.ioc.extract_iocs: classify the dex string pool into URLs /
+// IPs / domains / emails / onion addresses, denoise framework package names
+// that look like hosts, then tie each indicator back to its referencing class
+// via the native batched L7 search (xrefStringsToClasses).
+const IOC_CATS = ["urls", "ips", "domains", "emails", "onion"];
+const RE_URL   = /\b(?:https?|ftp|wss?):\/\/[^\s"'<>\\]+/gi;
+const RE_IPV4  = /\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?::\d{1,5})?\b/g;
+const RE_ONION = /\b[a-z2-7]{16}(?:[a-z2-7]{40})?\.onion\b/gi;
+const RE_EMAIL = /\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/g;
+const IOC_TLDS = ("com|net|org|io|cn|ru|info|top|xyz|app|me|co|tk|cc|biz|site|online|club|" +
+  "vip|pw|su|ws|cm|tv|gg|sh|dev|live|store|shop|fun|click|link|host|space|" +
+  "pro|mobi|asia|uk|de|fr|jp|kr|in|br|us|nl|eu|ir|kz|ua|by|ng|id|vn|th|ph");
+const RE_HOST  = new RegExp("\\b(?:[a-z0-9](?:[a-z0-9\\-]{0,61}[a-z0-9])?\\.)+(?:" + IOC_TLDS + ")\\b", "gi");
+const RDN_ROOTS = new Set("com org net edu gov mil int".split(" "));
+const PLATFORM_ROOTS = new Set("android androidx java javax kotlin kotlinx dalvik sun junit".split(" "));
+const DROP_ROOTS = new Set([...RDN_ROOTS, ...PLATFORM_ROOTS]);
+const DROP_HOSTS = new Set(["schemas.android.com", "www.w3.org", "xmlpull.org"]);
+const PKG_LABEL = /^[a-z0-9_$]+$/;
+
+function dexPackagePrefixes(descriptors) {
+  const pkgs = new Set();
+  for (const s of descriptors) {
+    const core = s.replace(/^\[+/, "");                       // arrays: [Lx; -> Lx;
+    if (!(core.startsWith("L") && core.endsWith(";") && core.includes("/"))) continue;
+    const labels = core.slice(1, -1).split("/").slice(0, -1).map(p => p.toLowerCase());
+    if (!labels.length || !labels.every(p => PKG_LABEL.test(p))) continue;
+    for (let i = 1; i <= labels.length; i++) pkgs.add(labels.slice(0, i).join("."));
+  }
+  return pkgs;
+}
+const isPackageLike = (host, pkgs) => {
+  const low = host.toLowerCase();
+  return DROP_HOSTS.has(low) || pkgs.has(low) || DROP_ROOTS.has(low.split(".")[0]);
+};
+const hostOf = url => ((url.split("://")[1] || "").split("/")[0].split("?")[0]);
+
+function classifyStrings(strings, dexPkgs) {
+  const b = { urls:new Set(), ips:new Set(), domains:new Set(), emails:new Set(), onion:new Set() };
+  for (const s of strings) {
+    let m;
+    RE_URL.lastIndex = 0;   while ((m = RE_URL.exec(s)))   b.urls.add(m[0].replace(/[.,);]+$/, ""));
+    RE_ONION.lastIndex = 0; while ((m = RE_ONION.exec(s))) b.onion.add(m[0].toLowerCase());
+    RE_IPV4.lastIndex = 0;  while ((m = RE_IPV4.exec(s)))  b.ips.add(m[0]);
+    RE_EMAIL.lastIndex = 0; while ((m = RE_EMAIL.exec(s))) b.emails.add(m[0]);
+    RE_HOST.lastIndex = 0;  while ((m = RE_HOST.exec(s)))  {
+      const host = m[0].toLowerCase();
+      if (!isPackageLike(host, dexPkgs)) b.domains.add(host);
+    }
+  }
+  for (const u of b.urls) {                                    // a URL's own host is high-confidence
+    const h = hostOf(u).split(":")[0].toLowerCase();
+    if (h.includes(".") && !isPackageLike(h, dexPkgs)) b.domains.add(h);
+  }
+  return b;
+}
+
+// Run the whole pipeline against the loaded dk; populates classIoc + iocTotals.
+function computeIocs(dkInst, descriptors) {
+  classIoc = new Map();
+  const dexPkgs = dexPackagePrefixes(descriptors);
+  const sv = dkInst.listStrings();
+  const strings = [];
+  for (let i = 0; i < sv.size(); i++) strings.push(sv.get(i));
+  sv.delete();
+  const buckets = classifyStrings(strings, dexPkgs);
+
+  // flat, deduped value list + the category each value belongs to
+  const valueCat = new Map();
+  for (const cat of IOC_CATS) for (const v of buckets[cat]) if (!valueCat.has(v)) valueCat.set(v, cat);
+  const values = [...valueCat.keys()];
+
+  iocTotals = { total: values.length };
+  for (const cat of IOC_CATS) iocTotals[cat] = buckets[cat].size;
+  if (!values.length) return;
+
+  // batched xref: value -> [classDescriptors]
+  const VS = new Module.VectorString();
+  for (const v of values) VS.push_back(v);
+  let perValueClasses;
+  try { perValueClasses = dkInst.xrefStringsToClasses(VS); }
+  finally { VS.delete(); }
+
+  for (let i = 0; i < values.length; i++) {
+    const cat = valueCat.get(values[i]);
+    const cls = perValueClasses[i] || [];
+    for (const cd of cls) {
+      let e = classIoc.get(cd);
+      if (!e) { e = { urls:new Set(), ips:new Set(), domains:new Set(), emails:new Set(), onion:new Set() }; classIoc.set(cd, e); }
+      e[cat].add(values[i]);
+    }
+  }
+}
+const iocCountFor = cd => {
+  const e = classIoc.get(cd); if (!e) return 0;
+  let n = 0; for (const cat of IOC_CATS) n += e[cat].size; return n;
+};
 
 createDexllm().then(m => {
   Module = m;
@@ -202,9 +341,29 @@ async function loadFile(file) {
   vec.delete();
   allClasses.sort();
 
-  statusEl.innerHTML = `<b>${file.name}</b> · ${dk.dexCount()} dex · ${allClasses.length} classes · ${loadMs}ms ${vpill}`;
+  // static network-IOC (C2) extraction — tied back to the referencing classes
+  statusEl.innerHTML = `<b>${file.name}</b> · scanning for network indicators…`;
+  classIoc = new Map(); iocTotals = null;
+  try {
+    const descriptors = allClasses.slice();
+    const tv = dk.listExternalTypeRefs();
+    for (let i = 0; i < tv.size(); i++) descriptors.push(tv.get(i));
+    tv.delete();
+    await new Promise(r => setTimeout(r, 0));   // let the "scanning…" status paint
+    computeIocs(dk, descriptors);
+  } catch (e) { console.error("IOC extraction failed:", e); iocTotals = null; }
+
+  const iocPill = (iocTotals && iocTotals.total)
+    ? ` · <span class="pill bad" title="distinct network indicators recovered from dex strings">⚑ ${iocTotals.total} IOC${iocTotals.total === 1 ? "" : "s"}</span>`
+    : ` · <span class="pill ok">no IOCs</span>`;
+  statusEl.innerHTML = `<b>${file.name}</b> · ${dk.dexCount()} dex · ${allClasses.length} classes · ${loadMs}ms ${vpill}${iocPill}`;
   $("#main").classList.add("show");
   drop.style.display = "none";
+  selectedEl = null;
+  $("#vname").textContent = "— select a class —"; $("#vmeta").textContent = "";
+  $("#iocbar").classList.add("empty"); $("#iocbar").innerHTML = "";
+  $("#code").innerHTML = '<div class="placeholder">Pick a class on the left to decompile it.' +
+    (iocTotals && iocTotals.total ? ' Classes that reference a network indicator are marked <span class="ioc-badge">⚑</span>.' : "") + '</div>';
   renderList("");
   $("#search").value = ""; $("#search").focus();
 }
@@ -227,9 +386,12 @@ function buildTree(classes) {
     }
     node.classes.push({ desc, label:name });
   }
-  (function count(n){ let t = n.classes.length;
-    for (const c of n.children.values()) t += count(c);
-    return n.count = t; })(root);
+  (function count(n){
+    let t = n.classes.length, ic = 0;
+    for (const c of n.classes) ic += iocCountFor(c.desc);
+    for (const c of n.children.values()) { count(c); t += c.count; ic += c.iocCount; }
+    n.count = t; n.iocCount = ic; return n;
+  })(root);
   return root;
 }
 
@@ -262,6 +424,12 @@ function makePkgRow(label, eff, depth, expand) {
   const pl = document.createElement("span"); pl.className = "pl"; pl.textContent = label;
   const cnt = document.createElement("span"); cnt.className = "cnt"; cnt.textContent = eff.count;
   row.append(tw, pl, cnt);
+  if (eff.iocCount > 0) {
+    const b = document.createElement("span"); b.className = "ioc-badge";
+    b.textContent = "⚑ " + eff.iocCount;
+    b.title = eff.iocCount + " network-indicator reference(s) under this package";
+    row.append(b);
+  }
   const kids = document.createElement("div"); kids.className = "kids"; kids.style.display = "none";
   let built = false;
   const toggle = open => {
@@ -279,9 +447,23 @@ function makeClassRow(c, depth) {
   const div = document.createElement("div");
   div.className = "cls";
   div.style.paddingLeft = (8 + depth * 14 + 16) + "px";
-  div.textContent = c.label; div.title = c.desc;
+  const name = document.createElement("span"); name.textContent = c.label;
+  div.append(name); div.title = c.desc;
+  const n = iocCountFor(c.desc);
+  if (n > 0) {
+    const b = document.createElement("span"); b.className = "ioc-badge";
+    b.textContent = "⚑ " + n; b.title = iocTitle(c.desc);
+    div.append(b);
+  }
   div.onclick = () => selectClass(c.desc, div);
   return div;
+}
+
+// Plain-text summary of a class's indicators (for badge tooltips).
+function iocTitle(cd) {
+  const e = classIoc.get(cd); if (!e) return "";
+  return IOC_CATS.filter(cat => e[cat].size)
+    .map(cat => `${cat}: ${[...e[cat]].join(", ")}`).join("\n");
 }
 
 function renderList(filter) {
@@ -348,12 +530,40 @@ function highlight(code) {
 }
 
 // ---- decompile ----
+function renderIocBar(cls) {
+  const bar = $("#iocbar");
+  const e = classIoc.get(cls);
+  bar.innerHTML = "";
+  if (!e) { bar.classList.add("empty"); return; }
+  const total = IOC_CATS.reduce((n, c) => n + e[c].size, 0);
+  if (!total) { bar.classList.add("empty"); return; }
+  bar.classList.remove("empty");
+  const hd = document.createElement("div"); hd.className = "iochd";
+  hd.innerHTML = `⚑ <b>${total}</b> network indicator${total === 1 ? "" : "s"} referenced by this class ` +
+    `<span style="color:var(--muted)">· recovered statically from dex strings · click to copy</span>`;
+  bar.appendChild(hd);
+  for (const cat of IOC_CATS) {
+    if (!e[cat].size) continue;
+    const row = document.createElement("div"); row.className = "iocrow";
+    const c = document.createElement("span"); c.className = "cat cat-" + cat; c.textContent = cat;
+    const vals = document.createElement("span"); vals.className = "vals";
+    for (const v of [...e[cat]].sort()) {
+      const p = document.createElement("span"); p.className = "iocpill " + cat;
+      p.textContent = v; p.title = "click to copy";
+      p.onclick = () => { navigator.clipboard?.writeText(v); p.classList.add("copied"); setTimeout(() => p.classList.remove("copied"), 600); };
+      vals.appendChild(p);
+    }
+    row.append(c, vals); bar.appendChild(row);
+  }
+}
+
 function selectClass(cls, el) {
   if (selectedEl) selectedEl.classList.remove("sel");
   selectedEl = el; el.classList.add("sel");
   $("#vname").textContent = cls;
   $("#vmeta").textContent = "decompiling…";
   $("#code").textContent = "";
+  renderIocBar(cls);
   // let the UI paint before the (synchronous) decompile
   setTimeout(() => {
     let t0 = performance.now();
