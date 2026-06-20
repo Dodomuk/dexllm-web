@@ -190,6 +190,8 @@
   #code { flex:1; overflow:auto; margin:0; padding:14px 18px; white-space:pre;
     tab-size:4; -webkit-overflow-scrolling:touch; position:relative;
     color:#5ef38c; }   /* single high-contrast color vs the black background */
+  /* huge classes are split into chunks; offscreen ones skip layout/paint */
+  #code .chunk { display:block; content-visibility:auto; }
   /* highlighted line: a single absolutely-positioned overlay, statically colored */
   #glowline {
     position:absolute; left:0; right:0; display:none; pointer-events:none;
@@ -972,12 +974,27 @@ function selectClass(cls, el, hint) {
 // Render decompiled Java in a single highlight pass (one innerHTML, no per-line
 // DOM). Raw lines are cached for fast line lookup; the glow uses an overlay.
 let codeLineCache = [];
+const CHUNK_LINES = 400;
 function renderCode(text) {
   const code = $("#code");
   codeLineCache = text.split("\n");
-  // No syntax highlighting: plain escaped text in one node (fast, no per-token
-  // spans). Code is shown in a single high-contrast color (see #code CSS).
-  code.innerHTML = escHtml(text);
+  const n = codeLineCache.length;
+  // No syntax highlighting: plain escaped text. For a huge class, split into
+  // content-visibility chunks so the browser only lays out/paints the visible
+  // part (a 3.6M-char class is otherwise one giant text node = jank). Line
+  // height is uniform so the glow overlay (top = line × lineHeight) still aligns.
+  if (text.length > 200000) {
+    const lh = parseFloat(getComputedStyle(code).lineHeight) || 19.5;
+    let html = "";
+    for (let i = 0; i < n; i += CHUNK_LINES) {
+      const cnt = Math.min(CHUNK_LINES, n - i);
+      html += '<div class="chunk" style="contain-intrinsic-size:0 ' + (cnt * lh) +
+        'px">' + escHtml(codeLineCache.slice(i, i + CHUNK_LINES).join("\n")) + '</div>';
+    }
+    code.innerHTML = html;
+  } else {
+    code.innerHTML = escHtml(text);
+  }
   const g = document.createElement("div"); g.id = "glowline";
   code.appendChild(g);
 }
