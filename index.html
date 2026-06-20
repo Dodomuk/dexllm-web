@@ -194,11 +194,10 @@
     position:absolute; left:0; right:0; display:none; pointer-events:none;
     background:#1f6feb22; border-left:2px solid var(--accent);
   }
-  #glowline.on { display:block; animation:lineglow 1.6s ease-out; }
-  @keyframes lineglow {
-    0%   { background:#58a6ffcc; box-shadow:0 0 22px #58a6ffaa; }
-    60%  { background:#1f6feb55; box-shadow:0 0 8px #58a6ff55; }
-    100% { background:#1f6feb22; box-shadow:none; }
+  #glowline.on { display:block; animation:lineglow .9s ease-out; }
+  @keyframes lineglow {   /* background-only flash — cheap to paint (no box-shadow) */
+    0%   { background:#58a6ff99; }
+    100% { background:#1f6feb22; }
   }
   .placeholder { color:var(--muted); padding:24px; }
   a { color:var(--accent); }
@@ -590,7 +589,7 @@ async function loadFile(file) {
   await transition;
   $("#main").classList.add("show");
   drop.style.display = "none";
-  selectedEl = null;
+  selectedEl = null; currentClass = null; codeLineCache = [];
   $("#vname").textContent = "— select a class —"; $("#vmeta").textContent = "";
   $("#iocbar").classList.add("empty"); $("#iocbar").innerHTML = "";
   $("#code").innerHTML = '<div class="placeholder">Pick a class on the left to decompile it.' +
@@ -940,10 +939,18 @@ function navigateToClass(desc, hint) {
   if (row) row.scrollIntoView({ block: "center", behavior: "instant" });
 }
 
+let currentClass = null;
 function selectClass(cls, el, hint) {
   if (selectedEl) selectedEl.classList.remove("sel");
   selectedEl = el || null;
   if (el) el.classList.add("sel");
+  // Same class already on screen → don't re-decompile/re-render; just re-glow.
+  // This makes jumping between indicators/callers within one class instant.
+  if (cls === currentClass && codeLineCache.length) {
+    if (hint) locateAndGlow(hint);
+    return;
+  }
+  currentClass = cls;
   $("#vname").textContent = cls;
   $("#vmeta").textContent = "decompiling…";
   $("#code").textContent = "";
