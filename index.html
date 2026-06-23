@@ -72,32 +72,70 @@
   }
   #search:focus { outline:none; border-color:var(--accent); }
   #count { padding:0 12px 6px; color:var(--muted); font-size:11px; }
-  /* per-dex tabs: [all] [classes.dex] [classes2.dex] [+dump-1.dex] + "+ dex" */
+  /* per-dex tabs — Chrome-style. The bar sits flush with the sidebar's bottom
+     content area; the active tab's background matches that area so it visually
+     "merges" into the class list (no bottom seam). Inactive tabs are slightly
+     dimmer with a top border. The strip scrolls horizontally instead of
+     wrapping so many tabs stay readable in the 380-px sidebar. */
   #dexbar {
-    display:none; flex-wrap:wrap; gap:4px; padding:6px 8px; border-bottom:1px solid var(--border);
-    background:var(--panel); align-items:center;
+    display:none; align-items:flex-end; gap:0; padding:6px 8px 0;
+    border-bottom:1px solid var(--border); background:var(--panel);
+    overflow-x:auto; overflow-y:hidden; scrollbar-width:thin;
+    flex:none; min-height:34px;
   }
   #dexbar.show { display:flex; }
+  #dexbar::-webkit-scrollbar { height:5px; }
+  #dexbar::-webkit-scrollbar-thumb { background:#ffffff14; border-radius:3px; }
   .dextab {
-    padding:3px 8px; border:1px solid var(--border); border-radius:11px;
-    background:var(--bg); color:var(--muted); cursor:pointer;
-    font:11px/1.4 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial;
-    white-space:nowrap;
+    flex:none; padding:6px 12px 7px; border:1px solid var(--border);
+    border-radius:8px 8px 0 0; background:var(--panel);
+    color:var(--muted); cursor:pointer; position:relative;
+    font:12px/1.3 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial;
+    white-space:nowrap; max-width:200px; overflow:hidden; text-overflow:ellipsis;
+    bottom:-1px;             /* drop 1px to overlap the bar's bottom border */
+    transition: background 120ms, color 120ms;
   }
-  .dextab:hover { background:#ffffff0a; color:var(--fg); }
-  .dextab.sel { background:var(--accent); border-color:var(--accent); color:#000; font-weight:600; }
-  .dextab.dump { border-style:dashed; border-color:var(--bad); color:var(--bad); }
-  .dextab.dump.sel { background:var(--bad); color:#fff; }
-  .dextab.bad { border-color:var(--bad); color:var(--bad); text-decoration:line-through; }
-  .dextab .n { opacity:0.6; margin-left:4px; }
+  .dextab + .dextab { margin-left:-1px; }   /* tabs share a vertical edge */
+  .dextab:hover { background:#ffffff10; color:var(--fg); z-index:1; }
+  .dextab.sel {
+    background:var(--panel);                 /* matches sidebar content area */
+    color:var(--fg);
+    border-bottom:1px solid var(--panel);    /* hide the seam under the tab */
+    font-weight:600;
+    z-index:2;
+    box-shadow:0 -1px 0 var(--accent) inset; /* a slim accent underline on the tab top edge */
+  }
+  .dextab.dump { color:#ff9a8c; }
+  .dextab.dump.sel { color:#ff9a8c; box-shadow:0 -1px 0 var(--bad) inset; }
+  .dextab.bad { color:var(--bad); text-decoration:line-through; }
+  .dextab .n {
+    display:inline-block; margin-left:6px; padding:1px 6px;
+    background:#ffffff14; border-radius:8px; font-size:10px;
+    color:var(--muted); font-weight:normal;
+  }
+  .dextab.sel .n { background:var(--hl); color:var(--fg); }
+  .dextab .ico { margin-right:5px; opacity:0.8; }
   #adddex {
-    padding:3px 9px; border:1px dashed var(--border); border-radius:11px;
+    flex:none; margin-left:6px; padding:4px 10px;
+    border:1px dashed var(--border); border-radius:6px;
     background:transparent; color:var(--muted); cursor:pointer;
-    font:11px/1.4 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial;
+    font:12px/1.3 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial;
+    align-self:center;
   }
-  #adddex:hover { background:#ffffff0a; color:var(--fg); border-color:var(--accent); }
+  #adddex:hover { color:var(--fg); border-color:var(--accent); }
   #adddex:disabled { opacity:0.4; cursor:wait; }
   #adddexfile { display:none; }
+
+  /* compact spinner used during async decompile (CSS keyframes run on the
+     compositor thread, so they keep ticking even if the main thread is busy
+     with synchronous wasm calls outside the worker). */
+  .spin {
+    display:inline-block; width:10px; height:10px; margin-right:6px;
+    border:2px solid var(--muted); border-top-color:transparent;
+    border-radius:50%; vertical-align:-1px;
+    animation: dexllm-spin 0.7s linear infinite;
+  }
+  @keyframes dexllm-spin { to { transform: rotate(360deg); } }
   #classlist { overflow:auto; flex:1; }
   .cls {
     padding:4px 12px; cursor:pointer; white-space:nowrap; overflow:hidden;
@@ -351,23 +389,18 @@ let dangerMap = null;            // permission -> [pkg.Class#method] (AOSP dange
 // the user adds a runtime-dumped dex. Sources are loaded in priority order:
 // dumps FIRST, original APK last → ART-style first-wins makes the dumped class
 // win a collision (mirrors the packer-unpack workflow described in
-// dexllm.add_dumped_dexes). vfsBytes lets us reconstruct the DexKit cheaply.
+// dexllm.add_dumped_dexes).
 //
-// Each `sources[i]` keeps its own STANDALONE single-source DexKit alive so the
-// per-dex view can decompile the LOSER of a cross-source first-wins collision
-// (e.g. a class present in BOTH the dump and the original — multi-source dk
-// hands you the dump's version, but the user can still inspect the original's
-// version by selecting that tab; this routes the call to originalSource.dk).
-// Within a multidex source, first-wins still applies inside that source's dk —
-// a class declared in both classes.dex and classes2.dex of the SAME apk only
-// decompiles to classes.dex's version (a known, rare limitation).
-let originalSource = null;       // {vfs, label, slotCount, dk, baseDexId}
-let dumpedSources  = [];         // [{vfs, label, slotCount, dk, baseDexId}, …]
-const vfsBytes = new Map();      // vfs path -> ArrayBuffer (kept so we can rebuild)
+// Decompile-time per-source routing (so the user can see the LOSER of a cross-
+// source first-wins collision) lives in the worker — it owns the per-source
+// DexKits. On the main thread we just need each source's vfs/label/slotCount
+// + the dexInfo→sourceIdx map (already in `dexInfo[i].sourceIdx`).
+let originalSource = null;       // {vfs, label, slotCount, baseDexId}
+let dumpedSources  = [];         // [{vfs, label, slotCount, baseDexId}, …]
+const vfsBytes = new Set();      // vfs paths held in MEMFS (path tracking only)
 let dexInfo = [];                // per-dex: [{dex_id, name, valid, reason, sourceLabel, dump, count, sourceIdx, localDexId}]
 let selectedDex = "all";         // "all" | <dex_id:number>; class list filter
 let dexClasses = new Map();      // dex_id -> [classDescriptor, …] (from listClassesInDex; no dedup)
-let dexIdToSource = new Map();   // dex_id -> source entry (for decompile routing)
 const $ = s => document.querySelector(s);
 const statusEl = $("#status");
 
@@ -797,6 +830,32 @@ createDexllm({ locateFile: (f) => f + "?v=" + window.__DEXLLM_BUILD }).then(m =>
   statusEl.innerHTML = "engine ready · <b>drop a file</b>";
 }).catch(e => { statusEl.innerHTML = '<span class="pill bad">engine load failed</span>'; console.error(e); });
 
+// ── decompile worker ───────────────────────────────────────────────────────
+// Decompile in wasm is synchronous on the calling thread — a heavy class can
+// block the main thread for many seconds, freezing scrolling, tab switches,
+// even the status spinner. Hand that work to a worker so the UI stays
+// responsive. The worker maintains its OWN parallel set of WasmDexKits keyed
+// by the same source order as the main thread, so cross-source overlap routing
+// still works.
+const worker = new Worker("worker.js?v=" + window.__DEXLLM_BUILD);
+const _pending = new Map(); let _wid = 1;
+worker.onmessage = e => {
+  const p = _pending.get(e.data.id); if (!p) return;
+  _pending.delete(e.data.id);
+  if (e.data.ok) p.resolve(e.data.result); else p.reject(new Error(e.data.error));
+};
+worker.onerror = e => console.error("worker error:", e.message);
+function wcall(msg, transfer) {
+  const id = _wid++;
+  return new Promise((res, rej) => {
+    _pending.set(id, { resolve: res, reject: rej });
+    worker.postMessage({ ...msg, id }, transfer || []);
+  });
+}
+// Hand the worker the build SHA so its locateFile picks the same cache-busted
+// wasm path (otherwise it would re-download dexllm.wasm with no query string).
+wcall({ type: "init", buildSha: window.__DEXLLM_BUILD }).catch(e => console.error("worker init failed", e));
+
 // ---- file intake ----
 const drop = $("#drop");
 $("#file").addEventListener("change", e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
@@ -882,24 +941,19 @@ async function loadFile(file) {
   const buf = new Uint8Array(await file.arrayBuffer());
   // Fresh load wipes any previously-added dumps; rewriting /input.bin so the
   // path stays stable lets the rebuild flow (multi-source ctor) reuse it.
-  for (const v of vfsBytes.keys()) { try { Module.FS.unlink(v); } catch (_) {} }
+  for (const v of vfsBytes) { try { Module.FS.unlink(v); } catch (_) {} }
   vfsBytes.clear();
-  // Tear down any cached per-source DexKits from the prior load (each owns
-  // a wasm heap allocation that won't be released until .delete()).
-  for (const s of dumpedSources) { try { s.dk && s.dk.delete(); } catch (_) {} }
-  if (originalSource && originalSource.dk) { try { originalSource.dk.delete(); } catch (_) {} }
   dumpedSources = [];
   try { Module.FS.writeFile("/input.bin", buf); } catch (_) {
     try { Module.FS.unlink("/input.bin"); } catch (_) {} Module.FS.writeFile("/input.bin", buf);
   }
-  vfsBytes.set("/input.bin", buf);
+  vfsBytes.add("/input.bin");
   selectedDex = "all";
   if (dk) { try { dk.delete(); } catch (_) {} dk = null; }
 
   let t0 = performance.now();
-  let standaloneDk;
   try {
-    standaloneDk = new Module.WasmDexKit("/input.bin");
+    dk = new Module.WasmDexKit("/input.bin");
   } catch (err) {
     const msg = (Module.getExceptionMessage && err && err.excPtr != null)
       ? Module.getExceptionMessage(err.excPtr) : err;
@@ -908,20 +962,21 @@ async function loadFile(file) {
     return;
   }
   const loadMs = (performance.now() - t0).toFixed(0);
-  // Keep the standalone single-source DexKit alongside `dk` so the per-dex
-  // tab can route decompile calls to it (lets the user see the LOSER of a
-  // cross-source first-wins collision). slotCount = attempted dexes (length
-  // of verifyReport), NOT dexCount() (which excludes rejected ones).
+  // slotCount = attempted dexes (length of verifyReport), NOT dexCount() (which
+  // excludes rejected ones).
   originalSource = {
     vfs: "/input.bin",
     label: file.name,
-    slotCount: standaloneDk.verifyReport().length,
-    dk: standaloneDk,
-    baseDexId: 0,    // recomputed by computeBaseDexIds
+    slotCount: dk.verifyReport().length,
+    baseDexId: 0,
   };
-  // No dumps yet → `dk` IS the standalone original. Each source's `dk` is
-  // disjoint from `dk` only when multi-source; when single-source they alias.
-  dk = standaloneDk;
+
+  // Mirror to the decompile worker. We hand it a fresh copy so transferring
+  // (zero-copy postMessage) doesn't detach the main thread's view.
+  const workerBuf = new Uint8Array(buf);
+  wcall({ type: "load", bytes: workerBuf, label: file.name }, [workerBuf.buffer]).catch(e => {
+    console.error("worker load failed:", e); statusEl.innerHTML += " <span class='pill bad'>worker offline</span>";
+  });
 
   await processCurrentDk(file.name, loadMs, { firstLoad: true, transition });
 }
@@ -930,16 +985,13 @@ async function loadFile(file) {
 // so first-wins resolution makes their classes win a collision (mirrors ART
 // after a packer unpack — `add_dumped_dexes(prefer=True)` in dexllm proper).
 // lenient=true so a partially-decrypted dump still loads under ART-structural-
-// equivalent verification. The standalone per-source DexKits (kept on each
-// source entry's `.dk`) are NOT replaced — they survive rebuilds so per-dex
-// decompile routing keeps working.
+// equivalent verification. The worker mirrors this on its own thread.
 function rebuildDk() {
-  // Drop only the aggregated multi-source dk (if it doesn't alias a per-source
-  // standalone — the no-dumps case where dk === originalSource.dk).
-  const aliasesOrig = dk === (originalSource && originalSource.dk);
-  if (dk && !aliasesOrig) { try { dk.delete(); } catch (_) {} }
-  dk = null;
-  if (!dumpedSources.length) { dk = originalSource.dk; return; }
+  if (dk) { try { dk.delete(); } catch (_) {} dk = null; }
+  if (!dumpedSources.length) {
+    dk = new Module.WasmDexKit(originalSource.vfs);
+    return;
+  }
   const VS = new Module.VectorString();
   for (const d of dumpedSources) VS.push_back(d.vfs);
   VS.push_back(originalSource.vfs);
@@ -948,20 +1000,12 @@ function rebuildDk() {
 }
 
 // (Re)compute each source's `baseDexId` (where its dexes start in the multi-
-// source layout) and the `dexIdToSource` map (global dex_id → owning source).
-// Sources are walked in priority order: dumps first, then original. Each
-// source contributes its `slotCount` consecutive dex_ids.
+// source layout). Sources are walked in priority order: dumps first, then
+// original. Each source contributes its `slotCount` consecutive dex_ids.
 function computeBaseDexIds() {
-  dexIdToSource = new Map();
   let cursor = 0;
-  for (let si = 0; si < dumpedSources.length; si++) {
-    const s = dumpedSources[si];
-    s.baseDexId = cursor;
-    for (let k = 0; k < s.slotCount; k++) dexIdToSource.set(cursor + k, s);
-    cursor += s.slotCount;
-  }
+  for (const s of dumpedSources) { s.baseDexId = cursor; cursor += s.slotCount; }
   originalSource.baseDexId = cursor;
-  for (let k = 0; k < originalSource.slotCount; k++) dexIdToSource.set(cursor + k, originalSource);
 }
 
 // Add a runtime-dumped .dex (or .apk holding dexes) on top of the current load.
@@ -980,31 +1024,32 @@ async function addDumpedDex(file) {
   try { Module.FS.writeFile(vfs, buf); } catch (_) {
     try { Module.FS.unlink(vfs); } catch (_) {} Module.FS.writeFile(vfs, buf);
   }
-  vfsBytes.set(vfs, buf);
+  vfsBytes.add(vfs);
 
-  // Single-load the dump as a standalone DexKit, kept ALIVE alongside the
-  // aggregated multi-source dk. The per-dex view routes decompile calls to
-  // this standalone dk when the user picks a tab whose dex belongs to this
-  // dump — that lets them see the dump's version of a class even when a
-  // higher-priority dump (or, in the orig-tab case, the dump itself) wins
-  // the global first-wins. Slot count = verifyReport length (attempted
-  // dexes), not dexCount() (loaded). lenient is implicit for the standalone
-  // — partial decrypts will be lenient-loaded on the multi-source rebuild.
+  // Probe the dump as a standalone DexKit just to capture its slot count
+  // (attempted dexes), then dispose — the worker will keep its own standalone
+  // for per-dex decompile routing. lenient is implicit; partial decrypts will
+  // be lenient-loaded on the multi-source rebuild below.
   const t0 = performance.now();
-  let standaloneDk, slotCount;
+  let slotCount;
   try {
-    standaloneDk = new Module.WasmDexKit(vfs);
-    slotCount = standaloneDk.verifyReport().length;
+    const probe = new Module.WasmDexKit(vfs);
+    slotCount = probe.verifyReport().length;
+    probe.delete();
   } catch (err) {
     const msg = (Module.getExceptionMessage && err && err.excPtr != null)
       ? Module.getExceptionMessage(err.excPtr) : err;
     statusEl.innerHTML = `<span class="pill bad">dump load failed</span> ${msg}`;
-    if (standaloneDk) { try { standaloneDk.delete(); } catch (_) {} }
     try { Module.FS.unlink(vfs); } catch (_) {}
     vfsBytes.delete(vfs);
     return;
   }
-  dumpedSources.push({ vfs, label: file.name, slotCount, dk: standaloneDk, baseDexId: 0 });
+  dumpedSources.push({ vfs, label: file.name, slotCount, baseDexId: 0 });
+
+  // Mirror dump to the worker so its routing stays in sync with sources[].
+  const workerBuf = new Uint8Array(buf);
+  wcall({ type: "addDump", bytes: workerBuf, label: file.name, vfs },
+        [workerBuf.buffer]).catch(e => console.error("worker addDump failed:", e));
 
   try {
     rebuildDk();
@@ -1012,8 +1057,7 @@ async function addDumpedDex(file) {
     const msg = (Module.getExceptionMessage && err && err.excPtr != null)
       ? Module.getExceptionMessage(err.excPtr) : err;
     statusEl.innerHTML = `<span class="pill bad">dump load failed</span> ${msg}`;
-    const popped = dumpedSources.pop();
-    if (popped) { try { popped.dk.delete(); } catch (_) {} }
+    dumpedSources.pop();
     try { Module.FS.unlink(vfs); } catch (_) {}
     vfsBytes.delete(vfs);
     rebuildDk();
@@ -1169,17 +1213,22 @@ function renderDexBar() {
     return b;
   };
 
-  makeTab("all", "all", { count: allClasses.length, title: "every loaded dex, first-wins applied" });
+  makeTab(`<span class="ico">▦</span>all`, "all", { count: allClasses.length, title: "every loaded dex, first-wins applied" });
   for (const d of dexInfo) {
+    const icon = d.dump ? "📦" : "📄";
+    const labelHtml = `<span class="ico">${icon}</span>` + escAttr(d.sourceLabel);
     if (!d.valid) {
-      makeTab(d.sourceLabel, "x-" + d.dex_id, { bad: true, title: "rejected at load: " + (d.reason || "verification failed") });
+      makeTab(labelHtml, "x-" + d.dex_id, { bad: true, title: "rejected at load: " + (d.reason || "verification failed") });
       continue;
     }
     const tip = d.dump
       ? `runtime-dumped dex (dex_id ${d.dex_id}) — its classes win collisions with the original APK`
       : `dex_id ${d.dex_id} (${d.count} declared classes)`;
-    makeTab(d.sourceLabel, d.dex_id, { count: d.count, dump: d.dump, title: tip });
+    makeTab(labelHtml, d.dex_id, { count: d.count, dump: d.dump, title: tip });
   }
+}
+function escAttr(s) {
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 }
 
 // Network-indicator / permission status pills (composed from current totals).
@@ -1545,41 +1594,40 @@ function selectClass(cls, el, hint) {
   }
   currentClass = cls;
   $("#vname").textContent = cls;
-  $("#vmeta").textContent = "decompiling…";
+  $("#vmeta").innerHTML = '<span class="spin"></span>decompiling…';
   $("#code").textContent = "";
   renderIocBar(cls);
-  // Route the decompile call. In "all" mode (and when the selected dex is the
-  // multi-source first-wins winner) we use the aggregated dk. When a specific
-  // dex tab is active, route to that dex's owning SOURCE so cross-source
-  // overlap shows the right version (e.g. the original APK's class when the
-  // user is on the original's tab, even though a dump's version is the global
-  // winner). The source's standalone dk still applies first-wins WITHIN that
-  // source — a known, rare limitation for within-source multidex collisions.
-  let useDk = dk, dexNote = "";
+  // Route the decompile call. In "all" mode we use the worker's aggregated dk
+  // (sourceIdx=-1). When a specific dex tab is active, route to that dex's
+  // owning SOURCE so cross-source overlap shows the right version (the source
+  // index matches the worker's sources[] order: dumps first, original last).
+  // The source's standalone dk still applies first-wins WITHIN that source —
+  // a known, rare limitation for within-source multidex collisions.
+  let sourceIdx = -1, dexNote = "";
   if (selectedDex !== "all") {
     const did = Number(selectedDex);
-    const src = dexIdToSource.get(did);
-    if (src && src.dk) {
-      useDk = src.dk;
-      const di = dexInfo.find(d => d.dex_id === did);
-      if (di) dexNote = ` · from ${di.sourceLabel}`;
-    }
+    const di = dexInfo.find(d => d.dex_id === did);
+    if (di) { sourceIdx = di.sourceIdx; dexNote = ` · from ${di.sourceLabel}`; }
   }
-  setTimeout(() => {
-    let t0 = performance.now();
-    let java;
-    try { java = useDk.decompileClassJava(cls); }
-    catch (err) {
-      const msg = (Module.getExceptionMessage && err && err.excPtr != null)
-        ? Module.getExceptionMessage(err.excPtr) : err;
-      java = "// decompile failed: " + msg;
-    }
-    const ms = (performance.now() - t0).toFixed(0);
-    renderCode(java || "// (empty — external/abstract class)");
-    $("#vmeta").textContent = `${java.length} chars · ${ms}ms${dexNote}` +
+  const reqStart = performance.now();
+  const reqClass = cls;
+  // Decompile is now async via the worker — the main thread stays responsive
+  // even while a heavy class takes seconds in wasm.
+  wcall({ type: "decompile", cls: reqClass, sourceIdx }).then(java => {
+    // Discard out-of-order responses: if the user clicked a different class
+    // while this one was decompiling, ignore this result.
+    if (currentClass !== reqClass) return;
+    const ms = (performance.now() - reqStart).toFixed(0);
+    const text = java || "// (empty — external/abstract class)";
+    renderCode(text);
+    $("#vmeta").textContent = `${text.length} chars · ${ms}ms${dexNote}` +
       (renderCode.plainLarge ? " · plain (large)" : "");
     if (hint) locateAndGlow(hint);
-  }, 0);
+  }).catch(err => {
+    if (currentClass !== reqClass) return;
+    renderCode("// decompile failed: " + (err.message || err));
+    $("#vmeta").textContent = "decompile failed" + dexNote;
+  });
 }
 
 // Render decompiled Java in a single highlight pass (one innerHTML, no per-line
