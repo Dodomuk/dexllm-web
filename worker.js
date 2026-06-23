@@ -47,22 +47,44 @@ function ensureInit() {
 }
 
 // Always returns a STRING — never an array or object — so the main thread's
-// `new Error(e.data.error)` never stringifies to "[object Object]". emscripten
-// 6.x's getExceptionMessage returns [type, message]; older versions a plain
-// string. Plain Error / RuntimeError have .message; everything else falls
-// through to JSON.stringify then Object.toString.
+// `new Error(e.data.error)` never stringifies to "[object Object]" or the raw
+// emscripten CppException JSON ({"excPtr":N}). Emscripten 6.x's
+// getExceptionMessage returns [type, message]; older versions a plain string.
+// If that path fails (function missing, throws, or returns empty), we MUST
+// still return a useful string — never JSON.stringify the CppException itself,
+// since its only enumerable property is excPtr which leaks as the raw pointer
+// to the user as "decompile failed: {\"excPtr\":35302424}".
 function describeError(err) {
   if (err == null) return "unknown error";
-  if (Module && Module.getExceptionMessage && err.excPtr != null) {
-    try {
-      const r = Module.getExceptionMessage(err.excPtr);
-      if (Array.isArray(r)) return r.filter(Boolean).join(": ");
-      if (typeof r === "string" && r) return r;
-    } catch (_) {}
-  }
   if (typeof err === "string") return err;
+
+  // emscripten CppException: { excPtr: number }. Translate via Module if
+  // it's available; otherwise fall through to a human-readable pointer note.
+  const ptr = (err && typeof err.excPtr === "number") ? err.excPtr : null;
+  if (ptr != null) {
+    if (Module && typeof Module.getExceptionMessage === "function") {
+      try {
+        const r = Module.getExceptionMessage(ptr);
+        if (Array.isArray(r)) {
+          const msg = r.filter(Boolean).map(String).join(": ");
+          if (msg) return msg;
+        }
+        if (typeof r === "string" && r) return r;
+      } catch (e) {
+        console.error("getExceptionMessage failed:", e);
+      }
+    }
+    // Last-resort label so the user sees SOMETHING coherent, not raw JSON.
+    return "wasm exception (excPtr=" + ptr + ")";
+  }
+
   if (err.message) return String(err.message);
-  try { const s = JSON.stringify(err); if (s && s !== "{}") return s; } catch (_) {}
+  if (err.name) return String(err.name);
+
+  try {
+    const s = JSON.stringify(err);
+    if (s && s !== "{}") return s;
+  } catch (_) {}
   return Object.prototype.toString.call(err);
 }
 
