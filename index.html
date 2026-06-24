@@ -2588,8 +2588,14 @@ function isSyntheticAccessor(desc) {
 // Expand callers transitively through synthetic-accessor chains so the popup
 // shows the actual call sites, not just `access$700`. Direct callers are
 // surfaced as-is; an accessor caller is replaced with ITS callers, recursively
-// (cycle-safe via the `seen` set). Each yielded record carries a `chain` so the
-// popup can show "via access$700 ← access$701" hops.
+// (cycle-safe via the `seen` set). Each yielded record carries:
+//   - desc      the caller method descriptor
+//   - offset    the bytecode offset of this specific invoke inside the caller
+//               (-1 when upstream didn't fill it in)
+//   - chain     accessor chain hops from desc → original target
+// Multiple invocations from the SAME caller method are KEPT as separate
+// records (one per offset) so the popup can show "× 1 of 2" / "× 2 of 2"
+// rather than silently deduping to one row.
 function resolveTransitiveCallers(useDk, descriptors, opts = {}) {
   const MAX_CHAIN = opts.maxChain ?? 4;
   const seen = new Set();
@@ -2599,19 +2605,19 @@ function resolveTransitiveCallers(useDk, descriptors, opts = {}) {
     const { desc, chain } = queue.shift();
     if (seen.has(desc) || chain.length > MAX_CHAIN) continue;
     seen.add(desc);
-    let cs;
-    try { cs = useDk.findCallSitesToApi(desc); }
+    let sites;
+    try { sites = useDk.findCallSitesWithOffset(desc); }
     catch (_) { continue; }
-    for (let i = 0; i < cs.size(); i++) {
-      const callerDesc = cs.get(i);
+    for (let i = 0; i < sites.length; i++) {
+      const callerDesc = sites[i].caller;
+      const offset = sites[i].offset;
       if (isSyntheticAccessor(callerDesc) && callerDesc !== desc) {
         // Walk through the accessor: enqueue ITS callers with a longer chain.
         queue.push({ desc: callerDesc, chain: [...chain, callerDesc] });
         continue;
       }
-      result.push({ desc: callerDesc, chain });
+      result.push({ desc: callerDesc, offset, chain });
     }
-    cs.delete();
   }
   return result;
 }
@@ -2653,45 +2659,60 @@ function showCallersFor(cls, name, anchor) {
       body.innerHTML = `<div class="callerpop-empty">${name} not declared on this class</div>`;
       return;
     }
-    // Transitively follow synthetic accessors. Dedup by caller descriptor;
-    // keep the shortest chain seen for any given (deduped) caller so the
-    // displayed "via" label reflects the most direct path.
+    // Transitively follow synthetic accessors.
     const records = resolveTransitiveCallers(useDk, overloads);
-    const byCaller = new Map();
-    for (const rec of records) {
-      const prev = byCaller.get(rec.desc);
-      if (!prev || rec.chain.length < prev.chain.length) byCaller.set(rec.desc, rec);
-    }
-    const callers = [...byCaller.values()].sort((a, b) => a.desc.localeCompare(b.desc));
-    if (!callers.length) {
+    if (!records.length) {
       const note = viewMode === "isolated" ? "no callers in this dex" : "no callers found";
       body.innerHTML = `<div class="callerpop-empty">${note}</div>`;
       return;
     }
+    // Sort: by descriptor, then by offset within each descriptor. This puts
+    // multiple-invocation rows from the same caller adjacent and in source
+    // order. Then assign a 1-based occurrence index per descriptor so each
+    // row can carry a "× 2 of 3" label and the navigation hint glows the
+    // matching `needle(` instance in the caller's body.
+    records.sort((a, b) => {
+      const c = a.desc.localeCompare(b.desc);
+      return c !== 0 ? c : (a.offset - b.offset);
+    });
+    const totals = new Map();
+    for (const r of records) totals.set(r.desc, (totals.get(r.desc) || 0) + 1);
+    const seenIdx = new Map();
+    for (const r of records) {
+      const next = (seenIdx.get(r.desc) || 0) + 1;
+      seenIdx.set(r.desc, next);
+      r.occurrence = next;
+      r.totalOcc = totals.get(r.desc);
+      // Also collapse to "shortest chain" semantics within the same
+      // (desc, offset) pair — if both a direct and an accessor-routed hit
+      // reach the same site, keep the direct one's metadata.
+    }
     body.innerHTML = "";
-    for (const c of callers) {
+    for (const c of records) {
       const item = document.createElement("div");
       item.className = "callerpop-item";
       const chainNote = c.chain.length
         ? `<span style="color:var(--fg-3);font:11px var(--f-ui);margin-left:6px">via ${c.chain.map(methodOfDescriptor).join(" → ")}</span>`
         : "";
-      item.innerHTML = escAttr(c.desc) + chainNote;
-      item.title = c.chain.length
-        ? `${c.desc}\nreached via accessor chain: ${c.chain.join(" → ")}`
-        : c.desc;
+      // Occurrence suffix: only shown when the caller has >1 invocations of
+      // the target. Offset is the dex bytecode address (smali "0x12") —
+      // unambiguous identifier of the specific invoke instruction.
+      const occNote = c.totalOcc > 1
+        ? `<span style="color:var(--fg-3);font:11px var(--f-ui);margin-left:6px">× ${c.occurrence} of ${c.totalOcc}${c.offset >= 0 ? " @ 0x" + c.offset.toString(16) : ""}</span>`
+        : "";
+      item.innerHTML = escAttr(c.desc) + chainNote + occNote;
+      item.title = (c.chain.length ? `${c.desc}\nreached via accessor chain: ${c.chain.join(" → ")}` : c.desc)
+                 + (c.totalOcc > 1 ? `\noccurrence ${c.occurrence} of ${c.totalOcc} (bytecode offset 0x${c.offset.toString(16)})` : "");
       const callerCls = c.desc.split("->")[0];
       const callerMethod = methodOfDescriptor(c.desc);
       item.onclick = () => {
         pop.classList.remove("show");
-        // Glow target:
-        //   - non-empty accessor chain → glow the first accessor invocation
-        //   - constructor mode → glow the class's simple name (the line
-        //     literally reads `new ClassName(...)` in DAD output)
-        //   - normal call → glow the called method name
         const needle = c.chain.length
           ? methodOfDescriptor(c.chain[0])
           : (isCtor ? simpleCls : name);
-        navigateToClass(callerCls, { needle, scope: callerMethod });
+        // occurrence: skip the first (occurrence-1) matches so the glow
+        // lands on the right `needle(` instance in the caller's body.
+        navigateToClass(callerCls, { needle, scope: callerMethod, occurrence: c.occurrence });
       };
       body.appendChild(item);
     }
@@ -3260,15 +3281,30 @@ function locateAndGlow(hint) {
   const lines = codeLineCache;
   if (!lines.length || !hint) return;
   const { needle, scope } = hint;
+  // occurrence (1-based, default 1): skip the first (occurrence-1) matches so
+  // the caller popup's "× N of M" rows each glow their own call site.
+  const occurrence = Math.max(1, hint.occurrence || 1);
   let scopeLine = -1;
   if (scope && !scope.startsWith("<"))   // skip <init>/<clinit>
     scopeLine = lines.findIndex(l => l.includes(scope + "("));
   let target = -1;
   if (needle) {
-    if (scopeLine >= 0)
-      for (let i = scopeLine; i < lines.length; i++)
-        if (lines[i].includes(needle)) { target = i; break; }
-    if (target < 0) target = lines.findIndex(l => l.includes(needle));
+    if (scopeLine >= 0) {
+      let skip = occurrence - 1;
+      for (let i = scopeLine + 1; i < lines.length; i++) {
+        if (!lines[i].includes(needle)) continue;
+        if (skip-- > 0) continue;
+        target = i; break;
+      }
+    }
+    if (target < 0) {
+      let skip = occurrence - 1;
+      for (let i = 0; i < lines.length; i++) {
+        if (!lines[i].includes(needle)) continue;
+        if (skip-- > 0) continue;
+        target = i; break;
+      }
+    }
   }
   if (target < 0) target = scopeLine;
   if (target < 0) return;
