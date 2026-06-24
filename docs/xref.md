@@ -167,3 +167,92 @@ When the rewrite happens, the following should land as one coherent module
 
 Until the rewrite, **keep new xref features adjacent to the existing ones**
 (don't sprinkle).
+
+## Gap analysis vs JEB and jadx
+
+What the current xref subsystem covers well, and what it's missing relative
+to the two production references. Treat this as the requirements list for the
+rewrite — every gap is a feature the rewrite should land or consciously
+decline.
+
+### Parity / better-than
+
+| Feature | dexllm-web | JEB | jadx |
+|---|---|---|---|
+| Method callers | ✓ — synthetic accessor expansion + multi-invocation rows with bytecode offset | ✓ | ✓ |
+| Field read/write split | ✓ — separate READ BY / WRITTEN BY sections | ✓ | ✗ (combined Find Usage) |
+| Multi-invocation disambiguation | ✓ — `× N of M @ 0xNN` per row | partial | ✗ |
+| Smali-faithful callee resolution | ✓ — invoke-* descriptor verbatim | ✓ | ✓ |
+| Browser back/forward | ✓ | ✓ (internal) | ✓ |
+
+### Missing — ranked by impact
+
+#### Phase 1 — large coverage gaps
+
+1. **Class/type xref.** `new X()` is forward-only. There's no "where is X
+   referenced?" — field types, parameter/return types, `instanceof`, casts,
+   annotation arguments, generic parameters. Both JEB and jadx treat this as
+   table stakes. Largest single gap. dexkit's `findUsingType` family covers it.
+2. **Override / implementor navigation.** Interface method → implementing
+   methods, abstract method → overrides, class → subclasses. dexkit exposes
+   `findMethodsImplementing` and `findClassesByExtends` but no UI consumer.
+3. **Class hierarchy navigation.** Click a class → super/implements/subclasses
+   panel (JEB's "Type Hierarchy", jadx's inheritance tree).
+4. **String xref from a code-site click.** The IoC panel maps strings →
+   classes, but clicking a string literal inside the decompiled body to see
+   "every other place this is referenced" isn't wired. `xrefStringsToClasses`
+   is already exposed.
+
+#### Phase 2 — UX
+
+5. **Result panel instead of popup.** A 480px-tall popup doesn't scale — a
+   method with 100+ callers becomes unusable. JEB has a dockable References
+   pane with group/filter/search; jadx opens results in a tab. Promote the
+   xref result UI from popup-only to a dockable side panel.
+6. **Human-readable descriptors.** Rows currently show
+   `La2dp/Vol/AppChooser$AppInfoCache;->getAppName()Ljava/lang/String;` —
+   JEB / jadx render `AppInfoCache.getAppName(): String`. Add a descriptor
+   → human-form formatter and use it everywhere xref output is shown.
+7. **Filtering.** App-only vs framework, package, kind (ctor / static /
+   instance). `dangerous_permission_api_callers` already has `app_only` —
+   the caller popup doesn't. Reuse the same filter.
+8. **Global symbol search.** Class list filtering exists, but there's no
+   "by name → method/field/class search → click to jump." JEB Ctrl+G, jadx
+   Ctrl+Shift+F.
+9. **Sort options.** Current sort is descriptor-alpha. Add frequency / package
+   proximity / distance-from-current sorts.
+
+#### Phase 3 — depth
+
+10. **Local variable highlighting.** Clicking `v0_3` should highlight every
+    occurrence inside the current method. Current handler bails on `^[vp]\d`.
+    jadx default behavior, JEB color-coded.
+11. **Smali ↔ Java view sync.** `renderMethodSmali` exists; not exposed as a
+    toggle with synchronized cursor. JEB synchronizes both views.
+12. **Reference-count badges.** JEB pre-renders `(↑12 ↓3)` next to method
+    names in the sidebar — incoming/outgoing call counts without a click.
+13. **Lambda / synthetic factory unwinding.** `access$NNN` is expanded but
+    `-$$Lambda$Cls$ABC.run()` and similar lambda factory hops aren't traced
+    back to their capture site. JEB does this end-to-end.
+14. **Override indicators in the gutter.** Tiny icons on the line gutter for
+    "overrides X" / "overridden by N".
+15. **Framework method markers.** SDK API callees marked + optionally linked
+    to docs (jadx does the marking).
+16. **Call graph visualization.** JEB has a graphical incoming/outgoing tree;
+    we have a flat list only. Lower priority but cited often.
+
+### Suggested rewrite phasing
+
+- **Phase 1** lands class/type xref + override/implementor + string
+  click-xref. After this, "find references" is symmetric across method /
+  field / class / string — the core JEB/jadx promise.
+- **Phase 2** replaces the popup with a dockable panel, switches all xref
+  output to human-readable descriptors, and adds the filter / global-search
+  / sort surface. The result panel becomes the entry point everything else
+  feeds into.
+- **Phase 3** adds local-var highlighting, smali sync, count badges,
+  lambda unwinding, gutter icons, framework markers, and (optionally) the
+  call-graph view. These are the "feels professional" details.
+
+Out of scope for this codebase (no plans): rename propagation, persistent
+project state / bookmarks. dexllm-web is a read-only triage view.
