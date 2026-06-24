@@ -37,10 +37,11 @@ let dumpedSources = [];                // alias of sources where .dump === true
 let originalSource = null;             // alias of sources[i] where .dump === false
 let initPromise = null;
 
-// Standalone-mode isolated DexKits: each loaded classes*.dex (across all
+// Isolated-mode per-dex DexKits: each loaded classes*.dex (across all
 // sources) gets its OWN single-dex WasmDexKit so the per-tab IoC and
 // dangerous-perm panels are TRULY isolated — no first-wins, no aggregation
-// pooling values from other dexes. Key = global aggregated dex_id (matches
+// pooling values from other dexes. Key = global aggregated dex_id for
+// regular APK dexes, or "x<N>" strings for Isolated-only extras (matches
 // what main thread tracks in `dexInfo`).
 let isolatedMap = new Map();
 
@@ -135,11 +136,11 @@ async function handleLoad({ bytes, label }) {
     try { Module.FS.unlink("/input.bin"); } catch (_) {}
     Module.FS.writeFile("/input.bin", buf);
   }
-  const standalone = new Module.WasmDexKit("/input.bin");
-  const slotCount = standalone.verifyReport().length;
-  originalSource = { vfs: "/input.bin", label, slotCount, dk: standalone, baseDexId: 0, dump: false };
+  const singleDk = new Module.WasmDexKit("/input.bin");
+  const slotCount = singleDk.verifyReport().length;
+  originalSource = { vfs: "/input.bin", label, slotCount, dk: singleDk, baseDexId: 0, dump: false };
   sources = [originalSource];
-  dk = standalone;
+  dk = singleDk;
   return { dexCount: dk.dexCount() };
 }
 
@@ -149,9 +150,9 @@ async function handleAddDump({ bytes, label, vfs }) {
     try { Module.FS.unlink(vfs); } catch (_) {}
     Module.FS.writeFile(vfs, buf);
   }
-  const standalone = new Module.WasmDexKit(vfs);
-  const slotCount = standalone.verifyReport().length;
-  const entry = { vfs, label, slotCount, dk: standalone, baseDexId: 0, dump: true };
+  const singleDk = new Module.WasmDexKit(vfs);
+  const slotCount = singleDk.verifyReport().length;
+  const entry = { vfs, label, slotCount, dk: singleDk, baseDexId: 0, dump: true };
   dumpedSources.push(entry);
   sources = [...dumpedSources, originalSource];
   rebuildDk();
@@ -159,7 +160,7 @@ async function handleAddDump({ bytes, label, vfs }) {
 }
 
 function handleDecompile({ cls, sourceIdx, isolatedKey }) {
-  // Standalone mode: route to the isolated single-dex WasmDexKit so the user
+  // Isolated mode: route to the isolated single-dex WasmDexKit so the user
   // sees THAT dex's body of the class (no first-wins from siblings in the
   // same source, no aggregation across sources).
   if (isolatedKey != null) {
@@ -174,7 +175,7 @@ function handleDecompile({ cls, sourceIdx, isolatedKey }) {
 
 // Receive ONE extracted dex's bytes from main, create an isolated DexKit, and
 // store under the global dex_id key. Called once per dex on entry to
-// standalone mode; idempotent if main re-sends.
+// Isolated mode; idempotent if main re-sends.
 async function handleAddIsolated({ bytes, vfs, key }) {
   const buf = new Uint8Array(bytes);
   try { Module.FS.writeFile(vfs, buf); } catch (_) {
