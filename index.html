@@ -454,9 +454,13 @@ let viewMode = "runtime";        // "runtime" | "standalone"
 //   aggregation. Each tab = one dex's universe; IoC + dangerous-perm panels
 //   show ONLY that dex's indicators, recomputed per tab.
 
-// Standalone-mode per-dex state. Key = global aggregated dex_id.
+// Standalone-mode per-dex state. Key = aggregated dex_id (number) for
+// regular dexes from the loaded APK, or a synthetic "x<N>" string for
+// standalone-only extras the user added via "+ dex" while in standalone.
 // {dk, classes, ioc:{classIoc,iocIndex,iocTotals}, perm:{permIndex,permTotals}, permLoaded}
 let isolated = new Map();
+let nextExtraKey = 1;            // counter for "x1", "x2", ... synthetic keys
+
 // Runtime-mode panel snapshot — captured when leaving runtime, restored when
 // switching back so the heavy first-load computation isn't redone.
 let runtimePanelSnap = null;
@@ -959,6 +963,11 @@ for (const btn of document.querySelectorAll("#modetoggle .mt")) {
 // "+ dex" button — runtime-dumped image (a .dex or a zip/apk holding decrypted
 // dexes) is loaded WITH PRIORITY over the original (first-wins → unpacked
 // classes win collisions, mirroring ART after a packer unpacks).
+// "+ dex" routes by mode:
+//   Runtime    → addDumpedDex (multi-source rebuild with prefer=true; mirrors
+//                dexllm.add_dumped_dexes)
+//   Standalone → addStandaloneDex (each contained classes*.dex becomes its
+//                own isolated tab; no priority effect, no aggregate change)
 $("#adddex").addEventListener("click", () => $("#adddexfile").click());
 $("#adddexfile").addEventListener("change", async e => {
   const files = [...(e.target.files || [])];
@@ -966,8 +975,12 @@ $("#adddexfile").addEventListener("change", async e => {
   if (!files.length) return;
   const btn = $("#adddex");
   btn.disabled = true; const orig = btn.textContent; btn.textContent = "+ dex …";
-  try { for (const f of files) await addDumpedDex(f); }
-  finally { btn.disabled = false; btn.textContent = orig; }
+  try {
+    for (const f of files) {
+      if (viewMode === "standalone") await addStandaloneDex(f);
+      else await addDumpedDex(f);
+    }
+  } finally { btn.disabled = false; btn.textContent = orig; }
 });
 // Drag-drop a .dex/.zip directly onto the sidebar dex bar adds it as a dump.
 const dexbarEl = $("#dexbar");
@@ -976,8 +989,12 @@ const dexbarEl = $("#dexbar");
 dexbarEl.addEventListener("drop", async e => {
   if (!originalSource) return;             // ignore drops before the apk is loaded
   const btn = $("#adddex"); btn.disabled = true; const orig = btn.textContent; btn.textContent = "+ dex …";
-  try { for (const f of e.dataTransfer.files) await addDumpedDex(f); }
-  finally { btn.disabled = false; btn.textContent = orig; }
+  try {
+    for (const f of e.dataTransfer.files) {
+      if (viewMode === "standalone") await addStandaloneDex(f);
+      else await addDumpedDex(f);
+    }
+  } finally { btn.disabled = false; btn.textContent = orig; }
 });
 
 // Outro/transition clip: on drop, swap the looping clip for trans.mp4 (same
@@ -1173,6 +1190,95 @@ async function addDumpedDex(file) {
   }
 }
 
+// Standalone "+ dex": add a .dex or zip/apk as one or more INDEPENDENT
+// isolated tabs. No multi-source rebuild, no priority resolution, no effect on
+// the runtime aggregate. Each classes*.dex inside the file gets its own
+// isolated WasmDexKit + its own tab + its own IoC/perm panels.
+async function addStandaloneDex(file) {
+  if (!Module || !originalSource) { alert("load an APK first"); return; }
+  const buf = new Uint8Array(await file.arrayBuffer());
+  const baseLabel = file.name;
+
+  // Throwaway probe DexKit — only used to discover the dexes inside and
+  // extract each one's raw bytes. Disposed before this function returns.
+  const probeVfs = "/probe-extra.bin";
+  try { Module.FS.writeFile(probeVfs, buf); } catch (_) {
+    try { Module.FS.unlink(probeVfs); } catch (_) {} Module.FS.writeFile(probeVfs, buf);
+  }
+  let probeDk, rep;
+  try {
+    probeDk = new Module.WasmDexKit(probeVfs);
+    rep = probeDk.verifyReport();
+  } catch (err) {
+    statusEl.innerHTML = `<span class="pill bad">add failed</span> ${describeError(err)}`;
+    try { Module.FS.unlink(probeVfs); } catch (_) {}
+    return;
+  }
+
+  const addedKeys = [];
+  for (const r of rep) {
+    if (!r.valid) continue;
+    let view;
+    try { view = probeDk.extractDexBytes(r.dex_id); }
+    catch (err) { console.warn("extractDexBytes failed for extra dex", err); continue; }
+    if (!view) continue;
+    const bytes = new Uint8Array(view);
+    const key = "x" + (nextExtraKey++);
+    const vfs = `/extra-${key}.dex`;
+    try { Module.FS.writeFile(vfs, bytes); } catch (_) {
+      try { Module.FS.unlink(vfs); } catch (_) {} Module.FS.writeFile(vfs, bytes);
+    }
+    let isoDk;
+    try { isoDk = new Module.WasmDexKit(vfs); }
+    catch (err) { console.warn("standalone isolated load failed", err); continue; }
+    // Pre-populate the class list so navigateToClass cross-tab lookups can
+    // find an extra without forcing a per-tab activate first.
+    const cv = isoDk.listClasses();
+    const classes = []; for (let i = 0; i < cv.size(); i++) classes.push(cv.get(i));
+    cv.delete(); classes.sort();
+    isolated.set(key, { dk: isoDk, classes, ioc: null, perm: null, permLoaded: false });
+
+    // Mirror to worker for decompile
+    const wbytes = new Uint8Array(bytes);
+    wcall({ type: "addIsolated", bytes: wbytes, vfs, key }, [wbytes.buffer])
+      .catch(e => console.error("worker addIsolated failed:", e));
+
+    // dexInfo entry so renderDexBar shows the tab. dump=true gives the
+    // dashed-red border so user-added tabs are visually distinct from
+    // APK-internal dexes. standaloneOnly so runtime mode never includes it.
+    const label = rep.length > 1 ? `${baseLabel} · ${r.name}` : baseLabel;
+    dexInfo.push({
+      dex_id: key,
+      name: r.name,
+      valid: true,
+      reason: "",
+      sourceLabel: label,
+      dump: true,
+      count: classes.length,
+      sourceIdx: -1,
+      localDexId: r.dex_id,
+      standaloneOnly: true,
+    });
+    addedKeys.push(key);
+  }
+
+  try { probeDk.delete(); } catch (_) {}
+  try { Module.FS.unlink(probeVfs); } catch (_) {}
+
+  if (!addedKeys.length) {
+    statusEl.innerHTML = `<span class="pill bad">add failed</span> no valid dex in ${file.name}`;
+    return;
+  }
+
+  selectedDex = addedKeys[0];
+  currentClass = null; codeLineCache = [];
+  activateStandaloneTab(selectedDex);
+  renderDexBar();
+  renderList($("#search").value || "");
+  renderPanels();
+  statusEl.innerHTML = standaloneStatusHead(selectedDex);
+}
+
 // Post-load pipeline shared between initial APK load and add-dumped-dex.
 // Recomputes verifier verdict + class list + per-dex placement + IOC + perms,
 // then re-renders the class browser and tabs. On first load, also waits for
@@ -1291,10 +1397,18 @@ function buildDexInfo(rep, perDexCount) {
 }
 
 // Sync the mode toggle's pill state to viewMode. Show the toggle only after
-// the first APK loads (controlled separately by processCurrentDk's path).
+// the first APK loads (controlled separately by processCurrentDk's path). Also
+// updates the "+ dex" button tooltip so the user can tell which kind of
+// addition they're about to perform.
 function renderModeToggle() {
   for (const b of document.querySelectorAll("#modetoggle .mt")) {
     b.classList.toggle("sel", b.dataset.mode === viewMode);
+  }
+  const adddex = $("#adddex");
+  if (adddex) {
+    adddex.title = viewMode === "standalone"
+      ? "Add a .dex / .apk — each contained dex becomes its own isolated tab (no priority, inspected independently)"
+      : "Add a runtime-dumped .dex / .apk on top (prefer=true → its classes win collisions, mirrors dexllm.add_dumped_dexes)";
   }
 }
 
@@ -1304,9 +1418,16 @@ function renderModeToggle() {
 function disposeIsolated() {
   for (const [did, iso] of isolated) {
     try { iso.dk.delete(); } catch (_) {}
+    // Regular dex_ids go to /iso-N.dex; standalone-only extras (string keys
+    // like "x1") go to /extra-x1.dex. Wipe both kinds.
     try { Module.FS.unlink(`/iso-${did}.dex`); } catch (_) {}
+    try { Module.FS.unlink(`/extra-${did}.dex`); } catch (_) {}
   }
   isolated.clear();
+  // Standalone-only entries in dexInfo go away with the iso dks; the next
+  // processCurrentDk rebuilds the regular ones.
+  dexInfo = dexInfo.filter(d => !d.standaloneOnly);
+  nextExtraKey = 1;
   if (Module) wcall({ type: "resetIsolated" }).catch(e => console.error("worker resetIso:", e));
 }
 
@@ -1346,7 +1467,9 @@ function ensureIsolated() {
 // so the UI paints first. Cached results live on the iso entry, so subsequent
 // switches to the same tab are instant.
 function activateStandaloneTab(did) {
-  const key = Number(did);
+  // did can be a number (regular dex_id) OR a string like "x1" (standalone-
+  // only extra added via "+ dex"). Map.get handles both transparently.
+  const key = did;
   const iso = isolated.get(key);
   if (!iso) return;
 
@@ -1376,7 +1499,9 @@ function activateStandaloneTab(did) {
 
   // Lazy perm — deferred so the UI paints before the L2 work starts. The
   // current-tab guard (closure over `key`) bails if the user switched away
-  // mid-flight, so we don't clobber the panel with a stale result.
+  // mid-flight, so we don't clobber the panel with a stale result. Uses
+  // `===` directly since key can be either number or string and both forms
+  // are stable for the closure's lifetime.
   if (iso.perm) {
     permIndex = iso.perm.permIndex;
     permTotals = iso.perm.permTotals;
@@ -1385,12 +1510,12 @@ function activateStandaloneTab(did) {
     permIndex = []; permTotals = null; permPending = true;
     renderPermPanel();
     setTimeout(async () => {
-      if (viewMode !== "standalone" || Number(selectedDex) !== key) return;
+      if (viewMode !== "standalone" || selectedDex !== key) return;
       if (!dangerMap) {
         try { dangerMap = await fetch("dangerous_perm_api.json").then(r => r.ok ? r.json() : {}); }
         catch (_) { dangerMap = {}; }
       }
-      if (viewMode !== "standalone" || Number(selectedDex) !== key) return;
+      if (viewMode !== "standalone" || selectedDex !== key) return;
       computePerms(iso.dk, true);
       iso.perm = { permIndex, permTotals };
       iso.permLoaded = true;
@@ -1404,7 +1529,7 @@ function activateStandaloneTab(did) {
 // Status line text for a standalone tab — replaces the global IoC/perm pills
 // with this tab's own counts.
 function standaloneStatusHead(did) {
-  const di = dexInfo.find(d => d.dex_id === did);
+  const di = dexInfo.find(d => d.dex_id === did || d.dex_id === Number(did));
   const lbl = di ? di.sourceLabel : `dex ${did}`;
   const iso = isolated.get(did);
   const cls = iso && iso.classes ? iso.classes.length : 0;
@@ -1490,14 +1615,15 @@ function renderDexBar() {
     b.addEventListener("click", () => {
       if (selectedDex === key) return;
       selectedDex = key;
-      // Tab switch changes which dk decompile routes to — and in standalone
-      // mode it also changes the IoC/perm panels' source dex. Bust the
-      // same-class cache so the next click re-decompiles via the new route.
       currentClass = null; codeLineCache = [];
-      renderDexBar();                        // refresh .sel state
-      renderList($("#search").value || "");  // refilter
-      if (viewMode === "standalone" && typeof key === "number") {
-        activateStandaloneTab(key);          // swap IoC/perm panels to this dex
+      renderDexBar();
+      renderList($("#search").value || "");
+      // In standalone, swap the IoC/perm panels to this tab's per-dex view.
+      // Skip "x-<N>" keys that mark rejected dexes (no isolated entry, would
+      // throw); accept both numeric keys (regular dexes) and "x<N>" strings
+      // (standalone-only extras added via "+ dex").
+      if (viewMode === "standalone" && isolated.has(key)) {
+        activateStandaloneTab(key);
         renderPanels();
         statusEl.innerHTML = standaloneStatusHead(key);
       }
@@ -1668,20 +1794,28 @@ function iocTitle(cd) {
 
 function renderList(filter) {
   const f = filter.toLowerCase().trim();
-  // dex-tab filter is applied BEFORE the text filter so the count line reflects
-  // "matches within the selected dex". "all" uses the deduped union; a specific
-  // dex tab uses listClassesInDex's output for THAT dex — so a class declared
-  // in multiple dexes (cross-source overlap) shows up in EACH of its tabs.
+  // Scope pool: "all" uses the deduped union (runtime aggregate). A per-dex
+  // tab in standalone mode draws from that dex's isolated DexKit class list.
+  // Standalone-only extras have string keys ("x1"); regular dexes use number
+  // keys; isolated map handles both transparently.
   let pool = allClasses;
   if (selectedDex !== "all") {
-    const did = Number(selectedDex);
-    if (Number.isFinite(did)) pool = dexClasses.get(did) || [];
+    const iso = isolated.get(selectedDex);
+    if (iso && iso.classes) {
+      pool = iso.classes;
+    } else {
+      // Fallback to dexClasses (the listClassesInDex output) for the case
+      // where we're in runtime + per-dex tab (legacy path, not reached now
+      // that runtime only shows [all]) or before ensureIsolated has populated.
+      const did = Number(selectedDex);
+      if (Number.isFinite(did)) pool = dexClasses.get(did) || [];
+    }
   }
   const items = f ? pool.filter(c => c.toLowerCase().includes(f)) : pool;
   const scopeLabel = selectedDex === "all"
     ? `${allClasses.length} classes`
     : (() => {
-        const di = dexInfo.find(d => d.dex_id === Number(selectedDex));
+        const di = dexInfo.find(d => d.dex_id === selectedDex || d.dex_id === Number(selectedDex));
         return `${pool.length} in ${di ? di.sourceLabel : "dex " + selectedDex}`;
       })();
   countEl.textContent = f ? `${items.length} / ${scopeLabel}` : scopeLabel;
@@ -1960,22 +2094,32 @@ function lazyXrefForIoc(value, cat) {
 //   - Runtime mode: switch to "all" — the aggregate sees every class.
 //   - Standalone mode: switch to the FIRST dex tab that declares the class.
 function navigateToClass(desc, hint) {
-  const pool = selectedDex === "all" ? null : dexClasses.get(Number(selectedDex));
+  // Check the currently active tab's class pool.
+  let pool;
+  if (selectedDex === "all") pool = null;
+  else {
+    const iso = isolated.get(selectedDex);
+    pool = iso ? iso.classes : dexClasses.get(Number(selectedDex));
+  }
   const inCurrentTab = !pool || pool.includes(desc);
   if (!inCurrentTab) {
     if (viewMode === "runtime") {
       selectedDex = "all";
     } else {
-      // Standalone: find a dex tab that has this class.
+      // Standalone: search every isolated tab (regular dex + extras).
       let found = null;
-      for (const [did, cls] of dexClasses) {
-        if (cls.includes(desc)) { found = did; break; }
+      for (const [key, iso] of isolated) {
+        if (iso.classes && iso.classes.includes(desc)) { found = key; break; }
       }
-      if (found != null) selectedDex = found;
+      if (found != null) {
+        selectedDex = found;
+        activateStandaloneTab(found);
+      }
     }
-    currentClass = null; codeLineCache = [];   // bust caches so re-decompile happens
+    currentClass = null; codeLineCache = [];
     renderDexBar();
     renderList($("#search").value || "");
+    renderPanels();
   }
   const row = [...listEl.querySelectorAll(".cls")].find(e => e.title === desc);
   selectClass(desc, row || null, hint);
@@ -2007,11 +2151,11 @@ function selectClass(cls, el, hint) {
   //     first-wins even within a multidex source)
   let sourceIdx = -1, isolatedKey = null, dexNote = "";
   if (selectedDex !== "all") {
-    const did = Number(selectedDex);
-    const di = dexInfo.find(d => d.dex_id === did);
+    // dexInfo entries use the raw key (number for regular, string for extras)
+    const di = dexInfo.find(d => d.dex_id === selectedDex || d.dex_id === Number(selectedDex));
     if (di) {
       if (viewMode === "standalone") {
-        isolatedKey = did;
+        isolatedKey = selectedDex;
         dexNote = ` · standalone (${di.sourceLabel})`;
       } else {
         sourceIdx = di.sourceIdx;
