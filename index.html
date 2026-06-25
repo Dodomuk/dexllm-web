@@ -528,6 +528,20 @@
     font:12px/1.65 var(--f-mono); color:var(--fg);
   }
   #smalipane.show { display:block; }
+  /* Draggable left edge — 6px hot zone overlapping the border so the user
+     finds it naturally. Hover/active shows the brand color. */
+  #smaliResize {
+    position:absolute; left:-3px; top:0; bottom:0; width:6px;
+    cursor:col-resize; z-index:6; user-select:none;
+  }
+  #smaliResize::before {
+    content:""; position:absolute; left:2px; top:0; bottom:0; width:2px;
+    background:transparent; transition:background 0.15s;
+  }
+  #smaliResize:hover::before,
+  #smaliResize.dragging::before { background:var(--brand); }
+  body.smaliResizing,
+  body.smaliResizing * { cursor:col-resize !important; user-select:none !important; }
   #smalipane .smalihd {
     padding:8px 14px; color:var(--fg-3); font:500 11px/1.4 var(--f-ui);
     border-bottom:1px solid var(--bd-1); position:sticky; top:0;
@@ -789,6 +803,7 @@
     <div id="iocbar" class="empty"></div>
     <pre id="code"><div class="placeholder">Pick a class on the left to decompile it.</div></pre>
     <div id="smalipane">
+      <div id="smaliResize" title="Drag to resize"></div>
       <div class="smalihd" id="smaliHd">smali — click a Java line in the code view</div>
       <pre id="smali"></pre>
     </div>
@@ -3416,19 +3431,73 @@ const smaliSync = {
   cache: new Map(),     // methodDesc → {pcMap, smaliText, smaliLines}
 };
 
+// Persisted pane width — restored on toggle, written on drop. Bounded to
+// [220, viewer*0.8] so the user can't hide the pane or starve the code
+// view of space.
+const SMALI_W_KEY = "dexllm-web.smaliWidth";
+function _smaliPaneWidth() {
+  const stored = parseInt(localStorage.getItem(SMALI_W_KEY) || "", 10);
+  if (Number.isFinite(stored) && stored >= 220) return stored;
+  return 520;
+}
+function _applySmaliPaneWidth(w) {
+  const viewer = $("#viewer");
+  const max = Math.max(260, viewer.clientWidth * 0.8);
+  w = Math.max(220, Math.min(max, w));
+  $("#smalipane").style.width = w + "px";
+  if (smaliSync.enabled) $("#code").style.paddingRight = (w + 20) + "px";
+  return w;
+}
+
 function toggleSmaliSync() {
   smaliSync.enabled = !smaliSync.enabled;
   const pane = $("#smalipane");
   const btn = $("#smaliBtn");
   pane.classList.toggle("show", smaliSync.enabled);
   btn.classList.toggle("active", smaliSync.enabled);
-  $("#code").style.paddingRight = smaliSync.enabled ? "540px" : "";
-  if (!smaliSync.enabled) {
+  if (smaliSync.enabled) {
+    _applySmaliPaneWidth(_smaliPaneWidth());
+  } else {
+    $("#code").style.paddingRight = "";
     smaliSync.methodDesc = null;
     $("#smali").innerHTML = "";
     $("#smaliHd").textContent = "smali — click a Java line in the code view";
   }
 }
+
+// Drag-to-resize. Captures pointer on mousedown, updates width on move,
+// persists on up. Cursor + selection are globally locked to avoid the
+// pointer flickering as it crosses iframes/elements during drag.
+(function _wireSmaliResize() {
+  let dragState = null;
+  const handle = $("#smaliResize");
+  if (!handle) return;
+  handle.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    dragState = { startX: e.clientX, startW: $("#smalipane").offsetWidth };
+    handle.classList.add("dragging");
+    document.body.classList.add("smaliResizing");
+  });
+  document.addEventListener("mousemove", (e) => {
+    if (!dragState) return;
+    // Drag right → narrower pane (pane is on the right edge), drag left → wider.
+    const dx = dragState.startX - e.clientX;
+    _applySmaliPaneWidth(dragState.startW + dx);
+  });
+  document.addEventListener("mouseup", () => {
+    if (!dragState) return;
+    dragState = null;
+    handle.classList.remove("dragging");
+    document.body.classList.remove("smaliResizing");
+    const w = $("#smalipane").offsetWidth;
+    localStorage.setItem(SMALI_W_KEY, String(w));
+  });
+  // Viewer resize → re-clamp (window resize might've shrunk the max).
+  window.addEventListener("resize", () => {
+    if (!smaliSync.enabled) return;
+    _applySmaliPaneWidth($("#smalipane").offsetWidth);
+  });
+})();
 function _smaliClearCache() {
   smaliSync.cache.clear();
   smaliSync.methodDesc = null;
