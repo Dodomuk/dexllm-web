@@ -298,7 +298,7 @@ analysis.
 
 | Gap | What's missing | Workaround |
 |---|---|---|
-| Smali ↔ Java view sync (#11) | DAD emits Java text via `Writer::WriteMethod`; baksmali emits smali. **No PC-to-source-line map is exposed across the boundary.** DAD's AST carries some position info but it's IR-num, not source-line. | Three-tier approach: D-1 side-panel (no sync, ~50 LoC, trivial); D-2 heuristic anchor matching (invoke/field/new/return order, ~200 LoC, 80–90% accurate); D-3 precise PC↔line map ([spec in `d3-pc-line-map.md`](d3-pc-line-map.md)) — requires a dexllm upstream PR that threads `RawIns::byte_off` from IR construction through Writer/JSONWriter into a new `DecompileMethodWithPcMap` API. Parity-neutral metadata-only change, ~570 LoC across two repos. |
+| Smali ↔ Java view sync (#11) | ~~DAD emits Java text via `Writer::WriteMethod`; baksmali emits smali. No PC-to-source-line map is exposed across the boundary.~~ | **LANDED** (D-3, dexllm#1 / PR#2 commit 565a716, dexllm-web commit 96d2450). dexllm now exposes `DecompileMethodWithPcMap(desc) → {source, pc_map}` with conditional/loop/switch header hooks per Finding A. dexllm-web's "↔ smali" toggle opens a right-docked smali pane with bidirectional click-to-sync. Verified: `doListFilter()` 13 pc_map entries, 4 hitting `if`/`while` headers (offsets 0x3a, 0x82, 0xae, 0x52). Original spec preserved in [`d3-pc-line-map.md`](d3-pc-line-map.md) for v1→v2→v3 revision history. |
 
 #### E. Explicitly out of scope (not a dexkit question)
 
