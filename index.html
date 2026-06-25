@@ -583,13 +583,34 @@
   .smali-num { color:#e5c378; }                     /* numbers */
   .smali-dir { color:#ff6b80; font-size:11px; }     /* .registers / .end method */
   .smali-cm  { color:var(--fg-3); font-style:italic; font-size:11px; } /* ;... comments */
+  /* "↔ smali" toggle — emphasized so it reads as the primary affordance
+     for the right-pane sync. Inactive: bordered with the brand-tinted
+     border + brand-colored arrow icon so it never disappears against the
+     viewer header gradient. Active: filled brand background, white text,
+     and a soft accent glow so the on-state is unmistakable across the page. */
   #vhead .smalibtn {
-    margin-left:auto; padding:3px 9px; border:1px solid var(--bd-1);
-    border-radius:4px; cursor:pointer; color:var(--fg-3);
-    font:500 11px/1.4 var(--f-ui); user-select:none;
+    margin-left:auto; padding:4px 12px;
+    border:1px solid rgba(107,161,255,0.45);
+    border-radius:5px; cursor:pointer;
+    color:var(--fg);
+    background:rgba(107,161,255,0.08);
+    font:600 12px/1.4 var(--f-ui); user-select:none;
+    letter-spacing:0.01em;
+    transition:background 0.15s, color 0.15s, border-color 0.15s, box-shadow 0.15s;
   }
-  #vhead .smalibtn:hover { color:var(--fg); border-color:var(--brand); }
-  #vhead .smalibtn.active { color:var(--brand); border-color:var(--brand); }
+  #vhead .smalibtn .smalibtn-icon {
+    color:var(--brand); margin-right:4px; font-weight:700;
+  }
+  #vhead .smalibtn:hover {
+    background:rgba(107,161,255,0.18);
+    border-color:var(--brand);
+    box-shadow:0 0 0 2px rgba(107,161,255,0.18);
+  }
+  #vhead .smalibtn.active {
+    background:var(--brand); color:#fff; border-color:var(--brand);
+    box-shadow:0 0 14px rgba(107,161,255,0.45);
+  }
+  #vhead .smalibtn.active .smalibtn-icon { color:#fff; }
   #vhead {
     padding:11px 18px; color:var(--fg-3);
     font:500 12px/1.4 var(--f-ui);
@@ -799,7 +820,7 @@
   <div id="viewer">
     <div id="vhead"><span class="name" id="vname">— select a class —</span>
       <span id="vmeta"></span>
-      <span class="smalibtn" id="smaliBtn" title="Toggle smali sync pane (D-3 line ↔ bytecode-offset map)">↔ smali</span></div>
+      <span class="smalibtn" id="smaliBtn" title="Toggle smali sync pane — click a Java line to see the matching bytecode instruction"><span class="smalibtn-icon">↔</span>smali</span></div>
     <div id="iocbar" class="empty"></div>
     <pre id="code"><div class="placeholder">Pick a class on the left to decompile it.</div></pre>
     <div id="smalipane">
