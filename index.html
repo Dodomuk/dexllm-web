@@ -2675,10 +2675,11 @@ function smaliInvokesFrom(useDk, methodDesc) {
   _smaliInvokesCache.set(methodDesc, invokes);
   return invokes;
 }
-// Called from places that want to drop ALL smali-derived caches (invokes,
-// fields, D-3 sync). Wired into selectClass via the explicit class-change
-// branch above; isolated/runtime mode changes go through _smaliBumpDk.
-function clearSmaliCacheForClass(/* cls */) { _smaliInvokesCache.clear(); _smaliFieldsCache.clear(); _smaliClearCache(); }
+// Drop every smali-derived cache (invokes, field accesses, D-3 sync state)
+// in one call. Used by selectClass on class change and by _smaliBumpDk on
+// mode/dk changes — the cost of an extra two Map.clear() calls per event is
+// negligible vs the risk of returning a previous class's cached parse.
+function clearAllSmaliCaches() { _smaliInvokesCache.clear(); _smaliFieldsCache.clear(); _smaliClearCache(); }
 
 const methodOfDescriptor = (md) => ((md.split("->")[1] || "").split("("))[0];
 
@@ -3443,33 +3444,49 @@ document.addEventListener("keydown", (e) => {
 // Java line in the code viewer scrolls/glows the matching smali instruction,
 // and vice versa. Toggle via the "↔ smali" button in the viewer header.
 
+// ── D-3 contract (DOM selectors) ──
+//   owned    : #smaliBtn  #smalipane  #smali  #smaliHd  #smaliResize
+//   borrowed : #code (paddingRight + scrollTop)  #viewer (clientWidth)
+//              #glowline (positioning)
+// All other code in this file MUST treat the owned set as opaque — when this
+// block is replaced by the planned src/xref.js module (see docs/xref.md),
+// only these IDs need a name swap.
+
+// Width contract for the smali pane (kept together so a future tweak is a
+// single coordinated change).
+const SMALI_W_MIN       = 220;     // user can never shrink past this
+const SMALI_W_DEFAULT   = 520;     // first-open + corrupt-storage fallback
+const SMALI_W_MAX_FRAC  = 0.8;     // pane never exceeds viewer.clientWidth × this
+const SMALI_W_MAX_FLOOR = 260;     // …but always at least this so a 200px viewer still has *some* room
+const SMALI_W_CODE_PAD  = 20;      // gap between #code's right edge and the pane
+const SMALI_CACHE_CAP   = 64;      // FIFO max in smaliSync.cache (≈2MB worst case)
+
 const smaliSync = {
   enabled: false,
   methodDesc: null,
-  dexName: null,                // simple name to display in header (overload / ctor / clinit aware)
+  dexName: null,                // simple name displayed in #smaliHd; also used by reverse sync
   classHeaderLine: -1,          // class-view line index of the currently-shown method's header
-  cacheClass: null,             // currentClass at the time the cache below was built
-  cacheDkToken: 0,              // bumped on every mode/dump/loadFile change to invalidate
-  cache: new Map(),             // methodDesc → {pcMap, smaliText, smaliLines}
+  cacheDkToken: 0,              // bumped on every mode/dump/loadFile change; defense-in-depth (the bump also clears the map)
+  cache: new Map(),             // methodDesc → {pcMap, smaliText, smaliLines, dkToken}
 };
 
 // Persisted pane width — restored on toggle, written on drop. Bounded to
-// [220, viewer*0.8] so the user can't hide the pane or starve the code
-// view of space.
+// [SMALI_W_MIN, max(SMALI_W_MAX_FLOOR, viewer × SMALI_W_MAX_FRAC)] so the
+// user can't hide the pane or starve the code view of space.
 const SMALI_W_KEY = "dexllm-web.smaliWidth";
 function _smaliPaneWidth() {
   let stored = NaN;
   try { stored = parseInt(localStorage.getItem(SMALI_W_KEY) || "", 10); }
   catch (_) {}
-  if (Number.isFinite(stored) && stored >= 220) return stored;
-  return 520;
+  if (Number.isFinite(stored) && stored >= SMALI_W_MIN) return stored;
+  return SMALI_W_DEFAULT;
 }
 function _applySmaliPaneWidth(w) {
   const viewer = $("#viewer");
-  const max = Math.max(260, viewer.clientWidth * 0.8);
-  w = Math.max(220, Math.min(max, w));
+  const max = Math.max(SMALI_W_MAX_FLOOR, viewer.clientWidth * SMALI_W_MAX_FRAC);
+  w = Math.max(SMALI_W_MIN, Math.min(max, w));
   $("#smalipane").style.width = w + "px";
-  if (smaliSync.enabled) $("#code").style.paddingRight = (w + 20) + "px";
+  if (smaliSync.enabled) $("#code").style.paddingRight = (w + SMALI_W_CODE_PAD) + "px";
   return w;
 }
 
@@ -3542,7 +3559,6 @@ function _smaliClearCache() {
   smaliSync.methodDesc = null;
   smaliSync.dexName = null;
   smaliSync.classHeaderLine = -1;
-  smaliSync.cacheClass = null;
   if (smaliSync.enabled) {
     $("#smali").innerHTML = "";
     $("#smaliHd").textContent = "smali — click a Java line in the code view";
@@ -3585,9 +3601,7 @@ function _loadMethodForSync(methodDesc) {
     dkToken: smaliSync.cacheDkToken,
   };
   // FIFO cap — Map preserves insertion order, so dropping the oldest key
-  // gives us approximate-LRU for free. Holds ~64 methods × ~30KB worst
-  // case ≈ 2MB. Tunable.
-  const SMALI_CACHE_CAP = 64;
+  // gives us approximate-LRU for free. Cap declared near the top of the block.
   if (smaliSync.cache.size >= SMALI_CACHE_CAP) {
     const firstKey = smaliSync.cache.keys().next().value;
     if (firstKey !== undefined) smaliSync.cache.delete(firstKey);
@@ -3611,13 +3625,11 @@ function _methodHeaderLine(fromLineIdx, methodSimpleName) {
     if (!/^\s*(public|private|protected|static|final|abstract|synchronized|native)\b/.test(line)) continue;
     if (line.includes(needle)) return i;
   }
-  // Fallback (rare): some constructors / static-init lines don't carry a
-  // modifier (package-private ctor in obfuscated code). Walk again without
-  // the modifier guard.
-  for (let i = fromLineIdx; i >= 0; i--) {
-    const line = codeLineCache[i];
-    if (line && line.includes(needle)) return i;
-  }
+  // A package-private (no-modifier) header would be invisible to this walk —
+  // but findEnclosingMethodName / _findMethodDescForSync both use the same
+  // modifier-guarded walk to discover the method name in the first place, so
+  // by the time we get here a no-modifier header would have already failed
+  // those upstream checks. No separate fallback needed.
   return -1;
 }
 
@@ -3648,15 +3660,20 @@ function _highlightSmaliLine(text) {
   }
   // Tokenize body. baksmali format:
   //   opcode v0[, v1, v2], target-descriptor[, literal]
-  // We just walk and color by token shape.
+  // The opcode group is one OPCODE_FAMILY suffix-shape — all baksmali opcodes
+  // are `family[-modifier...]` where family is one of the ~40 fixed roots
+  // below. Subsequent groups are: register, string, method ref, field ref,
+  // type, number, punctuation, whitespace, catchall.
   let out = "";
-  const RE = /(invoke-[a-z/-]+|iget[a-z/-]*|iput[a-z/-]*|sget[a-z/-]*|sput[a-z/-]*|const[a-z0-9/-]*|move[a-z/-]*|new-[a-z-]+|return[a-z/-]*|aget[a-z/-]*|aput[a-z/-]*|throw|monitor-[a-z]+|check-cast|instance-of|array-length|fill-array-data|filled-new-array[a-z/-]*|goto[/0-9]*|cmp[gl]?-[a-z]+|neg-[a-z]+|not-[a-z]+|int-to-[a-z]+|long-to-[a-z]+|float-to-[a-z]+|double-to-[a-z]+|add-[a-z0-9/-]+|sub-[a-z0-9/-]+|mul-[a-z0-9/-]+|div-[a-z0-9/-]+|rem-[a-z0-9/-]+|and-[a-z0-9/-]+|or-[a-z0-9/-]+|xor-[a-z0-9/-]+|shl-[a-z0-9/-]+|shr-[a-z0-9/-]+|ushr-[a-z0-9/-]+|rsub-[a-z0-9/-]+|if-[a-z]+|nop|packed-switch|sparse-switch)|([vp]\d+)|("(?:\\.|[^"\\])*")|(L[\w\/$]+;->[a-zA-Z_$<][\w$<>]*\([^)]*\)[\w\/$;\[]+)|(L[\w\/$]+;->[a-zA-Z_$][\w$]*:[\w\/$;\[]+)|(L[\w\/$]+;|\[+[A-Z][\w\/$;]*)|(-?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?|0x[0-9a-fA-F]+|0[bB][01]+)|([,{}()])|(\s+)|([^\s,{}()]+)/g;
+  const RE = /\b(invoke|iget|iput|sget|sput|const|move|new|return|aget|aput|throw|monitor|check-cast|instance-of|array-length|fill-array-data|filled-new-array|goto|cmp[gl]?|neg|not|int-to|long-to|float-to|double-to|add|sub|mul|div|rem|and|or|xor|shl|shr|ushr|rsub|if|nop|packed-switch|sparse-switch)(?:[-/][a-z0-9/-]+)?\b|([vp]\d+)|("(?:\\.|[^"\\])*")|(L[\w\/$]+;->[a-zA-Z_$<][\w$<>]*\([^)]*\)[\w\/$;\[]+)|(L[\w\/$]+;->[a-zA-Z_$][\w$]*:[\w\/$;\[]+)|(L[\w\/$]+;|\[+[A-Z][\w\/$;]*)|(-?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?|0x[0-9a-fA-F]+|0[bB][01]+)|([,{}()])|(\s+)|([^\s,{}()]+)/g;
   let mm, last = 0;
   while ((mm = RE.exec(body))) {
     out += escAttr(body.slice(last, mm.index));
     last = RE.lastIndex;
-    if (mm[1])      out += `<span class="smali-op">${escAttr(mm[0])}</span>`;
-    else if (mm[2]) out += `<span class="smali-reg">${escAttr(mm[0])}</span>`;
+    // Groups 1 (opcode), 2 (register), 7 (number) can't contain HTML-special
+    // chars by their own regex — skip escAttr for those.
+    if (mm[1])      out += `<span class="smali-op">${mm[0]}</span>`;
+    else if (mm[2]) out += `<span class="smali-reg">${mm[0]}</span>`;
     else if (mm[3]) out += `<span class="smali-str">${escAttr(mm[0])}</span>`;
     else if (mm[4]) {
       // Method target: Lcls;->name(proto)Ret. Color cls / method name.
@@ -3678,7 +3695,7 @@ function _highlightSmaliLine(text) {
            + `<span class="smali-typ">${escAttr(mm[0].slice(colon + 1))}</span>`;
     }
     else if (mm[6]) out += `<span class="smali-typ">${escAttr(mm[0])}</span>`;
-    else if (mm[7]) out += `<span class="smali-num">${escAttr(mm[0])}</span>`;
+    else if (mm[7]) out += `<span class="smali-num">${mm[0]}</span>`;
     else if (mm[8]) out += `<span style="color:var(--fg-3)">${escAttr(mm[0])}</span>`;
     else            out += escAttr(mm[0]);
   }
@@ -3764,14 +3781,8 @@ function _findMethodDescForSync(cls, codeLineIdx, useDk) {
   const candidates = [mname];
   if (mname === classSimple) candidates.push("<init>", "<clinit>");
   if (mname === "static")    candidates.push("<clinit>");
-  // Find the header line (modifier + simpleName + `(`).
-  let headerLineIdx = -1;
-  for (let i = codeLineIdx; i >= 0; i--) {
-    const ln = codeLineCache[i];
-    if (!ln) continue;
-    if (!/^\s*(public|private|protected|static|final|abstract|synchronized|native)\b/.test(ln)) continue;
-    if (ln.includes(mname + "(")) { headerLineIdx = i; break; }
-  }
+  // Share the header walkback with the rest of the block.
+  const headerLineIdx = _methodHeaderLine(codeLineIdx, mname);
   const javaParams = headerLineIdx >= 0 ? _countJavaHeaderParams(codeLineCache[headerLineIdx]) : -1;
   const ms = useDk.listClassMethods(cls);
   const matches = [];
@@ -4370,9 +4381,9 @@ function selectClass(cls, el, hint) {
   // Class is changing — D-3 smaliSync state (methodDesc, classHeaderLine,
   // cache) is per-class; clear it so a stale forward-sync header doesn't
   // glow an arbitrary line in the new class on a subsequent smali click.
-  // The umbrella clearSmaliCacheForClass also drops the L4 invoke/field
+  // The umbrella clearAllSmaliCaches also drops the L4 invoke/field
   // caches that are descriptor-keyed and could mismatch across classes.
-  if (cls !== currentClass) clearSmaliCacheForClass();
+  if (cls !== currentClass) clearAllSmaliCaches();
   currentClass = cls;
   pushNavState(hint);
   $("#vname").textContent = cls;
